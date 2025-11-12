@@ -249,78 +249,74 @@ def blox_fruits_trader():
         batch_running = False
         should_stop = False
 
-    class AutoSendManager:
-        def __init__(self, send_coro, max_idle=15):
-            self.heap = []
-            self.index = {}
-            self.send_coro = send_coro
-            self.max_idle = max_idle
-            self.task = None
-            self.running = False
+    class ChannelScheduleManager:
+        def __init__(self):
+            self._schedule = {}
 
-        def start(self):
-            if self.running:
-                return
-            self.running = True
-            self.task = bot.loop.create_task(self._run())
+        def schedule(self, channel_id, timestamp):
+            try:
+                self._schedule[str(channel_id)] = float(timestamp)
+            except (TypeError, ValueError) as e:
+                print(f"Could not schedule channel {channel_id} with timestamp {timestamp}: {e}", type_="WARNING")
 
-        async def stop(self):
-            self.running = False
-            if self.task:
-                self.task.cancel()
-                try:
-                    await self.task
-                except Exception:
-                    pass
-                self.task = None
+        def get(self, channel_id, default=None):
+            return self._schedule.get(str(channel_id), default)
 
-        def schedule(self, channel_id, ts):
-            if channel_id is None:
-                return
-            if self.index.get(channel_id) == ts:
-                return
-            self.index[channel_id] = ts
-            heapq.heappush(self.heap, (ts, channel_id))
+    manager = ChannelScheduleManager()
 
-        def unschedule(self, channel_id):
-            if channel_id is None:
-                return
-            self.index.pop(channel_id, None)
+    def to_timestamp(value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value).timestamp()
+        except ValueError:
+            return None
 
-        def reset(self):
-            self.heap.clear()
-            self.index.clear()
+    def channel_cooldown_seconds(ch):
+        try:
+            sd = getattr(ch, "slowmode_delay", None)
+            return int(sd) if sd is not None else 60
+        except (ValueError, TypeError):
+            return 60
 
-        async def _run(self):
-            while self.running:
-                now = time.time()
-                while self.heap and (
-                    self.heap[0][1] not in self.index or self.heap[0][0] != self.index[self.heap[0][1]]
-                ):
-                    heapq.heappop(self.heap)
+    def compute_next_ts(ch, last_sent_ts=None):
+        base = time.time() if last_sent_ts is None else last_sent_ts
+        return base + channel_cooldown_seconds(ch)
 
-                if not self.heap:
-                    await asyncio.sleep(self.max_idle)
-                    continue
+    def get_last_sent_ts(channel_id, record=None):
+        entry = record
+        if entry is None:
+            data = load_data()
+            target = str(channel_id)
+            entry = next((tc for tc in data.get("trade_channels", []) if str(tc.get("id")) == target), None)
+        if not entry:
+            return None
+        return to_timestamp(entry.get("last_sent"))
 
-                ts, ch_id = self.heap[0]
-                delay = ts - now
+    def get_cooldown_until_ts(record):
+        if not record:
+            return None
+        return to_timestamp(record.get("cooldown_until"))
 
-                if delay > 0:
-                    await asyncio.sleep(min(delay, self.max_idle))
-                    continue
+    def schedule_channel(ch, record):
+        if not ch or not record:
+            return
 
-                heapq.heappop(self.heap)
-                if self.index.get(ch_id) != ts:
-                    continue
+        cid = record.get("id") or getattr(ch, "id", None)
+        if not cid:
+            return
 
-                self.index.pop(ch_id, None)
-                try:
-                    await self.send_coro(ch_id)
-                except Exception as e:
-                    print(f"✗ send error {ch_id}: {describe_error(e)}", type_="ERROR")
+        last_sent_ts = get_last_sent_ts(cid, record)
+        if last_sent_ts is None:
+            last_sent_ts = time.time() - channel_cooldown_seconds(ch)
 
-    manager = None
+        next_ts = compute_next_ts(ch, last_sent_ts)
+
+        cooldown_until_ts = get_cooldown_until_ts(record)
+        if cooldown_until_ts is not None:
+            next_ts = max(next_ts, cooldown_until_ts)
+
+        manager.schedule(cid, next_ts)
 
     def sanitize_trade_channels(raw_channels):
         if not isinstance(raw_channels, list):
@@ -1078,29 +1074,72 @@ def blox_fruits_trader():
     async def detect():
         det_btn.loading = True; det_btn.disabled = True
         try:
-            rows_to_insert = []
-            rows_to_update = []
+            d = load_data()
+            added = 0
+            updated = 0
+            kw = ["trading", "slow-trading", "fast-trading", "trade-chat", "trades", "trade"]
+            ex = ["pvb", "sab"]
+            
+            print("Scanning servers for trading channels...", type_="INFO")
+            
+            for g in bot.guilds:
+                for ch in g.text_channels:
+                    n = ch.name.lower()
+                    if any(k in n for k in kw) and not any(n.startswith(e) for e in ex):
+                        cid = str(ch.id)
+                        cooldown = channel_cooldown_seconds(ch)
 
-            new_channels, updated_channels = await discover_trade_channels()
+                        trade_emoji = await find_trade_emoji(g)
 
-            for channel in new_channels:
-                row = build_channel_row(channel)
-                if row:
-                    rows_to_insert.append(row)
+                        existing = next((tc for tc in d["trade_channels"] if tc["id"] == cid), None)
+                        if existing:
+                            # Refresh cooldown and metadata so auto-send respects actual timing
+                            if existing.get("cooldown") != cooldown:
+                                existing["cooldown"] = cooldown
+                                updated += 1
+                            existing["server_id"] = str(g.id)
+                            existing["server_name"] = g.name
+                            existing["server_icon"] = str(g.icon.url) if g.icon else ""
+                            existing["channel_name"] = ch.name
+                            if trade_emoji:
+                                existing["trade_emoji"] = trade_emoji
 
-            for channel in updated_channels:
-                row = build_channel_row(channel)
-                if row:
-                    rows_to_update.append(row)
+                            schedule_channel(ch, existing)
 
-            if rows_to_update:
-                ch_table.update_rows(rows_to_update)
+                            row = build_channel_row(existing)
+                            if row:
+                                ch_table.update_rows([row])
+                        else:
+                            # New entry with actual cooldown
+                            new_entry = {
+                                "id": cid,
+                                "server_id": str(g.id),
+                                "server_name": g.name,
+                                "server_icon": str(g.icon.url) if g.icon else "",
+                                "channel_name": ch.name,
+                                "cooldown": cooldown,
+                                "last_sent": None,
+                                "trade_emoji": trade_emoji,
+                                "cooldown_until": None
+                            }
 
-            if rows_to_insert:
-                ch_table.insert_rows(rows_to_insert)
+                            d["trade_channels"].append(new_entry)
 
-            total_detected = len(rows_to_insert) + len(rows_to_update)
-            print(f"✓ Detected {total_detected} channels", type_="SUCCESS")
+                            schedule_channel(ch, new_entry)
+
+                            row = build_channel_row(new_entry)
+                            if row:
+                                ch_table.insert_rows([row])
+                            added += 1
+                            print(f"Found: {ch.name} in {g.name}", type_="SUCCESS")
+            
+            save_data(d)
+            print(f"✓ Detection complete: Found {added} new trading channels", type_="SUCCESS")
+            
+            # Enable start button if we have channels and trade configured
+            if d["trade_channels"] and d["trade_offers"] and d["trade_requests"]:
+                start_btn.disabled = False
+                
         except Exception as e:
             print(f"✗ Detect failed: {describe_error(e)}", type_="ERROR")
         finally:
