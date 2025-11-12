@@ -28,7 +28,8 @@ def blox_fruits_trader():
     FRUIT_ALIASES = {
         "leopard": ["tiger"], "rumble": ["lightning"], "spirit": ["soul"],
         "t-rex": ["trex", "rex"], "control": ["kage"], "dough": ["doughnut"],
-        "buddha": ["budha"], "phoenix": ["phenix", "pheonix"]
+        "buddha": ["budha"], "phoenix": ["phenix", "pheonix"],
+        "storage": ["capacity"], "storages": ["capacity"],
     }
 
     TOKEN_PATTERN = re.compile(r'<a?:[^:]+:\d+>|:[^:\s]+:|[^,\s]+')
@@ -252,6 +253,23 @@ def blox_fruits_trader():
 
     data = load_data()
     emoji_cache = load_emoji_cache()
+
+    # Ensure new aliases bypass any stale cache entries so they resolve immediately.
+    CACHE_PURGE_KEYS = {"storage", "storages"}
+    cache_purged = False
+    for guild_id, entries in list(emoji_cache.items()):
+        if not isinstance(entries, dict):
+            emoji_cache[guild_id] = {}
+            cache_purged = True
+            continue
+
+        for key in CACHE_PURGE_KEYS:
+            if key in entries:
+                del entries[key]
+                cache_purged = True
+
+    if cache_purged:
+        save_emoji_cache(emoji_cache)
 
     # UI
     tab = Tab(name='BF Trader', title="Blox Fruits Trader", icon="convert")
