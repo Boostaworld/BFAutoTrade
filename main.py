@@ -1,4 +1,5 @@
 import json
+import os
 import asyncio
 import random
 import re
@@ -119,6 +120,72 @@ def blox_fruits_trader():
         batch_running = False
         task = None
         should_stop = False
+        manager = None
+        server_paused = True
+        safe_mode_enabled = False
+        safe_mode_delay = 0
+
+    def update_server_pause_state(paused):
+        if AutoState.server_paused == paused:
+            return
+        AutoState.server_paused = paused
+        state = "paused" if paused else "resumed"
+        print(f"Server {state}", type_="INFO")
+
+    def set_safe_mode(enabled, delay=0):
+        delay_value = max(0, int(delay or 0))
+        if (
+            AutoState.safe_mode_enabled == enabled
+            and AutoState.safe_mode_delay == delay_value
+        ):
+            return
+        AutoState.safe_mode_enabled = enabled
+        AutoState.safe_mode_delay = delay_value
+        if enabled:
+            print(f"Safe mode enabled (delay={delay_value}s)", type_="INFO")
+        else:
+            print("Safe mode disabled", type_="INFO")
+
+    class AutoSendManager:
+        def __init__(self):
+            self.running = False
+            self.task = None
+
+        def start(self):
+            if self.running:
+                return
+            print("Auto-send starting", type_="INFO")
+            self.running = True
+            AutoState.running = True
+            update_server_pause_state(False)
+            self.task = bot.loop.create_task(auto_loop(self))
+            AutoState.task = self.task
+
+        async def stop(self):
+            if not self.running:
+                return
+            print("Auto-send stopping", type_="INFO")
+            self.running = False
+            AutoState.running = False
+            update_server_pause_state(True)
+            task, self.task = self.task, None
+            AutoState.task = None
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    print(f"✗ Auto-send stop error: {describe_error(e)}", type_="ERROR")
+            set_safe_mode(False, 0)
+
+    AutoState.manager = AutoSendManager()
+
+    def stop_autosend():
+        manager = AutoState.manager
+        if manager and manager.running:
+            bot.loop.create_task(manager.stop())
 
     def sanitize_trade_channels(raw_channels):
         if not isinstance(raw_channels, list):
@@ -251,11 +318,13 @@ def blox_fruits_trader():
     def save_data(data):
         try:
             tmp = DATA_FILE.with_suffix(".tmp")
-            with open(tmp, "w") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)
-            tmp.replace(DATA_FILE)
-        except:
-            pass
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, DATA_FILE)
+        except Exception as e:
+            print(f"✗ Failed to save data: {describe_error(e)}", type_="ERROR")
 
     def load_emoji_cache():
         try:
@@ -586,6 +655,8 @@ def blox_fruits_trader():
             return False, f"Error: {e}"
 
     async def send_test_format():
+        test_btn.loading = True
+        test_btn.disabled = True
         print("Sending test format...", type_="INFO")
         try:
             d = load_data()
@@ -608,7 +679,10 @@ def blox_fruits_trader():
             else:
                 print(f"✗ Test format failed: {describe_error(err)}", type_="ERROR")
         except Exception as e:
-            print(f"Test format error: {e}", type_="ERROR")
+            print(f"✗ Test format failed: {describe_error(e)}", type_="ERROR")
+        finally:
+            test_btn.loading = False
+            test_btn.disabled = False
 
     # Main Functions
     def sendNowToChannel_sync(row_id):
@@ -634,12 +708,13 @@ def blox_fruits_trader():
             
             msg = await build_msg(channel["server_id"], d["trade_offers"], d["trade_requests"], channel.get("trade_emoji"))
             ok, err = await send_to(channel["id"], msg)
-            
+
             if ok:
                 now = datetime.now()
                 channel["last_sent"] = now.isoformat()
                 channel["cooldown_until"] = None
                 save_data(d)
+                set_safe_mode(False, 0)
                 print(f"✓ Sent to {channel['channel_name']}", type_="SUCCESS")
 
                 row = build_channel_row(channel)
@@ -661,6 +736,7 @@ def blox_fruits_trader():
                         if row:
                             ch_table.update_rows([row])
 
+                        set_safe_mode(True, int(retry_seconds))
                         print(f"⌛ {channel['channel_name']}: retry in {int(retry_seconds)}s", type_="WARNING")
                         return
 
@@ -670,10 +746,12 @@ def blox_fruits_trader():
                     cooldown_val = 60
                 channel["cooldown_until"] = (datetime.now() + timedelta(seconds=cooldown_val)).isoformat()
                 save_data(d)
+                set_safe_mode(False, 0)
                 print(f"✗ {channel['channel_name']}: {describe_error(err)}", type_="ERROR")
 
         except Exception as e:
-            print(f"Send error: {e}", type_="ERROR")
+            set_safe_mode(False, 0)
+            print(f"Send error: {describe_error(e)}", type_="ERROR")
     
     def removeChannel_sync(row_id):
         removeChannel(row_id)
@@ -784,35 +862,35 @@ def blox_fruits_trader():
                 start_btn.disabled = False
                 
         except Exception as e:
-            print(f"Detect failed: {e}", type_="ERROR")
+            print(f"✗ Detect failed: {describe_error(e)}", type_="ERROR")
         finally:
             det_btn.loading = False
             det_btn.disabled = False
 
     async def add():
         add_btn.loading = True
+        add_btn.disabled = True
         sid = srv_in.value.strip()
         cids = ch_in.value.strip()
         cd = int(cd_in.value) if cd_in.value.isdigit() else 60
-        
-        if not sid or not cids:
-            print("Need Server ID and Channel IDs", type_="WARNING")
-            add_btn.loading = False
-            return
-        
+        relock_button = False
+
         try:
+            if not sid or not cids:
+                print("Need Server ID and Channel IDs", type_="WARNING")
+                return
+
             g = bot.get_guild(int(sid))
             if not g:
                 print("Server not found", type_="ERROR")
-                add_btn.loading = False
                 return
-            
+
             d = load_data()
-            for cid in [c.strip() for c in cids.split(",")]:
+            for cid in [c.strip() for c in cids.split(",") if c.strip()]:
                 ch = bot.get_channel(int(cid))
                 if not ch or any(tc["id"] == cid for tc in d["trade_channels"]):
                     continue
-                
+
                 d["trade_channels"].append({
                     "id": cid,
                     "server_id": sid,
@@ -824,25 +902,29 @@ def blox_fruits_trader():
                     "trade_emoji": await find_trade_emoji(g),
                     "cooldown_until": None
                 })
-                
+
                 row = build_channel_row(d["trade_channels"][-1])
                 if row:
                     ch_table.insert_rows([row])
-            
+
             save_data(d)
-            print(f"Added channels", type_="SUCCESS")
+            print("Added channels", type_="SUCCESS")
             srv_in.value = ""
             ch_in.value = ""
-            add_btn.disabled = True
-            
+            relock_button = True
+
             # Enable start button if we have trade configured
             if d["trade_offers"] and d["trade_requests"]:
                 start_btn.disabled = False
-                
+
         except Exception as e:
-            print(f"Add failed: {e}", type_="ERROR")
+            print(f"✗ Add failed: {describe_error(e)}", type_="ERROR")
         finally:
             add_btn.loading = False
+            add_btn.disabled = False
+
+        if relock_button:
+            add_btn.disabled = True
 
     def save_trade():
         save_btn.loading = True
@@ -913,12 +995,13 @@ def blox_fruits_trader():
                 
                 msg = await build_msg(c["server_id"], d["trade_offers"], d["trade_requests"], c.get("trade_emoji"))
                 ok, err = await send_to(c["id"], msg)
-                
+
                 if ok:
                     sent += 1
                     now = datetime.now()
                     c["last_sent"] = now.isoformat()
                     c["cooldown_until"] = None
+                    set_safe_mode(False, 0)
                     print(f"[{idx}/{total}] ✓ {c['channel_name']}", type_="SUCCESS")
                 else:
                     fail += 1
@@ -930,8 +1013,10 @@ def blox_fruits_trader():
                         if retry_seconds > 0:
                             next_time = datetime.now() + timedelta(seconds=retry_seconds)
                             c["cooldown_until"] = next_time.isoformat()
+                            set_safe_mode(True, int(retry_seconds))
                             print(f"[{idx}/{total}] ⏳ {c['channel_name']}: retry in {int(retry_seconds)}s", type_="WARNING")
                         else:
+                            set_safe_mode(False, 0)
                             print(f"[{idx}/{total}] ✗ {c['channel_name']}: {describe_error(err)}", type_="ERROR")
                     else:
                         try:
@@ -940,12 +1025,14 @@ def blox_fruits_trader():
                             cooldown_val = 60
                         next_time = datetime.now() + timedelta(seconds=cooldown_val)
                         c["cooldown_until"] = next_time.isoformat()
+                        set_safe_mode(False, 0)
                         print(f"[{idx}/{total}] ✗ {c['channel_name']}: {describe_error(err)}", type_="ERROR")
 
                 await asyncio.sleep(random.uniform(2, 4))
             except Exception as e:
                 fail += 1
-                print(f"[{idx}/{total}] ✗ {c['channel_name']}: {str(e)}", type_="ERROR")
+                set_safe_mode(False, 0)
+                print(f"[{idx}/{total}] ✗ {c['channel_name']}: {describe_error(e)}", type_="ERROR")
         
         save_data(d)
         
@@ -958,114 +1045,125 @@ def blox_fruits_trader():
         AutoState.should_stop = False
         start_btn.disabled = False
         stop_btn.disabled = True
-    async def auto_loop():
-        print("Auto-send loop startedV3", type_="SUCCESS")
+    async def auto_loop(manager):
+        print("Auto-send loop started", type_="INFO")
 
         error_log = []
 
-        while AutoState.running:
-            try:
-                d = load_data()
+        try:
+            while manager.running:
+                try:
+                    d = load_data()
 
-                if not d["trade_offers"] or not d["trade_requests"] or not d["trade_channels"]:
-                    await asyncio.sleep(5)
-                    continue
+                    if not d["trade_offers"] or not d["trade_requests"] or not d["trade_channels"]:
+                        await asyncio.sleep(5)
+                        continue
 
-                sent_this_loop = 0
+                    sent_this_loop = 0
 
-                channels_with_cooldowns = []
-                for c in d["trade_channels"]:
-                    rem = get_cooldown_remaining(c)
-                    channels_with_cooldowns.append((rem, c))
+                    channels_with_cooldowns = []
+                    for c in d["trade_channels"]:
+                        rem = get_cooldown_remaining(c)
+                        channels_with_cooldowns.append((rem, c))
 
-                channels_with_cooldowns.sort(key=lambda x: x[0])
+                    channels_with_cooldowns.sort(key=lambda x: x[0])
 
-                for rem, c in channels_with_cooldowns:
-                    if not AutoState.running:
-                        break
+                    for rem, c in channels_with_cooldowns:
+                        if not manager.running:
+                            break
 
-                    if rem <= 0:
-                        try:
-                            msg = await build_msg(c["server_id"], d["trade_offers"], d["trade_requests"], c.get("trade_emoji"))
-                            ok, err = await send_to(c["id"], msg)
-
-                            if ok:
-                                now = datetime.now()
-                                c["last_sent"] = now.isoformat()
-                                c["cooldown_until"] = None
-                                sent_this_loop += 1
-                                print(f"✓ Auto: {c['channel_name']}", type_="SUCCESS")
-                            else:
-                                message = describe_error(err)
-                                if isinstance(err, dict) and err.get("type") == "cooldown":
-                                    try:
-                                        retry_seconds = float(err.get("retry_after", 0))
-                                    except (TypeError, ValueError):
-                                        retry_seconds = 0
-
-                                    if retry_seconds > 0:
-                                        next_time = datetime.now() + timedelta(seconds=retry_seconds)
-                                        c["cooldown_until"] = next_time.isoformat()
-                                        print(f"⌛ Auto: {c['channel_name']} retry in {int(retry_seconds)}s", type_="WARNING")
-                                    else:
-                                        print(f"✗ Auto: {c['channel_name']}: {message}", type_="ERROR")
-                                else:
-                                    try:
-                                        cooldown_val = int(c.get("cooldown", 60))
-                                    except:
-                                        cooldown_val = 60
-                                    next_time = datetime.now() + timedelta(seconds=cooldown_val)
-                                    c["cooldown_until"] = next_time.isoformat()
-                                    print(f"✗ Auto: {c['channel_name']}: {message}", type_="ERROR")
-
-                                error_log.append(f"{c['channel_name']}: {message}")
-
-                            await asyncio.sleep(random.uniform(2, 4))
-                        except Exception as e:
+                        if rem <= 0:
                             try:
-                                cooldown_val = int(c.get("cooldown", 60))
-                            except:
-                                cooldown_val = 60
-                            next_time = datetime.now() + timedelta(seconds=cooldown_val)
-                            c["cooldown_until"] = next_time.isoformat()
-                            print(f"✗ Auto: {c['channel_name']}: {str(e)}", type_="ERROR")
-                            error_log.append(f"{c['channel_name']}: {str(e)}")
+                                msg = await build_msg(c["server_id"], d["trade_offers"], d["trade_requests"], c.get("trade_emoji"))
+                                ok, err = await send_to(c["id"], msg)
 
-                save_data(d)
+                                if ok:
+                                    now = datetime.now()
+                                    c["last_sent"] = now.isoformat()
+                                    c["cooldown_until"] = None
+                                    sent_this_loop += 1
+                                    set_safe_mode(False, 0)
+                                    print(f"✓ Auto: {c['channel_name']}", type_="SUCCESS")
+                                else:
+                                    message = describe_error(err)
+                                    if isinstance(err, dict) and err.get("type") == "cooldown":
+                                        try:
+                                            retry_seconds = float(err.get("retry_after", 0))
+                                        except (TypeError, ValueError):
+                                            retry_seconds = 0
 
-                min_wait = float('inf')
-                for rem, _ in channels_with_cooldowns:
-                    if rem < min_wait:
-                        min_wait = rem
+                                        if retry_seconds > 0:
+                                            next_time = datetime.now() + timedelta(seconds=retry_seconds)
+                                            c["cooldown_until"] = next_time.isoformat()
+                                            set_safe_mode(True, int(retry_seconds))
+                                            print(f"⌛ Auto: {c['channel_name']} retry in {int(retry_seconds)}s", type_="WARNING")
+                                        else:
+                                            set_safe_mode(False, 0)
+                                            print(f"✗ Auto: {c['channel_name']}: {message}", type_="ERROR")
+                                    else:
+                                        try:
+                                            cooldown_val = int(c.get("cooldown", 60))
+                                        except (TypeError, ValueError):
+                                            cooldown_val = 60
+                                        next_time = datetime.now() + timedelta(seconds=cooldown_val)
+                                        c["cooldown_until"] = next_time.isoformat()
+                                        set_safe_mode(False, 0)
+                                        print(f"✗ Auto: {c['channel_name']}: {message}", type_="ERROR")
 
-                if sent_this_loop > 0:
-                    wait_time = 1
-                elif min_wait != float('inf') and min_wait > 0:
-                    wait_time = min(min_wait, 10)
-                else:
-                    wait_time = 5
+                                    error_log.append(f"{c['channel_name']}: {message}")
 
-                await asyncio.sleep(wait_time)
+                                await asyncio.sleep(random.uniform(2, 4))
+                            except Exception as e:
+                                try:
+                                    cooldown_val = int(c.get("cooldown", 60))
+                                except (TypeError, ValueError):
+                                    cooldown_val = 60
+                                next_time = datetime.now() + timedelta(seconds=cooldown_val)
+                                c["cooldown_until"] = next_time.isoformat()
+                                error_message = describe_error(e)
+                                print(f"✗ Auto: {c['channel_name']}: {error_message}", type_="ERROR")
+                                error_log.append(f"{c['channel_name']}: {error_message}")
 
-            except Exception as e:
-                print(f"Auto-loop error: {str(e)}", type_="ERROR")
-                await asyncio.sleep(10)
+                    save_data(d)
 
-        # Print all errors when stopped
-        if error_log:
-            print(f"\n=== Auto-send Error Summary ({len(error_log)} errors) ===", type_="WARNING")
-            # Group errors by type
-            error_counts = {}
-            for err in error_log:
-                if err not in error_counts:
-                    error_counts[err] = 1
-                else:
-                    error_counts[err] += 1
+                    min_wait = float('inf')
+                    for rem, _ in channels_with_cooldowns:
+                        if rem < min_wait:
+                            min_wait = rem
 
-            for err, count in error_counts.items():
-                print(f"  [{count}x] {err}", type_="ERROR")
+                    if sent_this_loop > 0:
+                        wait_time = 1
+                    elif min_wait != float('inf') and min_wait > 0:
+                        wait_time = min(min_wait, 10)
+                    else:
+                        wait_time = 5
 
-        print("Auto-send loop stopped", type_="INFO")
+                    await asyncio.sleep(wait_time)
+
+                except Exception as e:
+                    print(f"Auto-loop error: {describe_error(e)}", type_="ERROR")
+                    await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if error_log:
+                print(f"\n=== Auto-send Error Summary ({len(error_log)} errors) ===", type_="WARNING")
+                error_counts = {}
+                for err in error_log:
+                    if err not in error_counts:
+                        error_counts[err] = 1
+                    else:
+                        error_counts[err] += 1
+
+                for err, count in error_counts.items():
+                    print(f"  [{count}x] {err}", type_="ERROR")
+
+            set_safe_mode(False, 0)
+            AutoState.running = False
+            manager.running = False
+            manager.task = None
+            update_server_pause_state(True)
+            print("Auto-send loop stopped", type_="INFO")
 
     def start_operation():
         d = load_data()
@@ -1077,13 +1175,14 @@ def blox_fruits_trader():
         if not d["trade_channels"]:
             print("Add channels first", type_="WARNING")
             return
-        
+
         if auto_check.checked:
             # Start auto-send loop
-            AutoState.running = True
+            if AutoState.manager is None:
+                AutoState.manager = AutoSendManager()
+            AutoState.manager.start()
             start_btn.disabled = True
             stop_btn.disabled = False
-            AutoState.task = bot.loop.create_task(auto_loop())
         else:
             # Send one batch
             bot.loop.create_task(send_batch())
@@ -1091,13 +1190,9 @@ def blox_fruits_trader():
     def stop_operation():
         if auto_check.checked:
             # Stop auto-send loop
-            if AutoState.running:
-                AutoState.running = False
-                if AutoState.task:
-                    AutoState.task.cancel()
-                start_btn.disabled = False
-                stop_btn.disabled = True
-                print("Auto-send loop stopped", type_="INFO")
+            stop_autosend()
+            start_btn.disabled = False
+            stop_btn.disabled = True
         else:
             # Stop batch operation
             if AutoState.batch_running:
