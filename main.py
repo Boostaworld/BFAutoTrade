@@ -2,6 +2,7 @@ import json
 import asyncio
 import random
 import re
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 import discord
@@ -119,6 +120,75 @@ def blox_fruits_trader():
         batch_running = False
         task = None
         should_stop = False
+
+    class ChannelScheduleManager:
+        def __init__(self):
+            self._schedule = {}
+
+        def schedule(self, channel_id, timestamp):
+            try:
+                self._schedule[str(channel_id)] = float(timestamp)
+            except (TypeError, ValueError):
+                pass
+
+        def get(self, channel_id, default=None):
+            return self._schedule.get(str(channel_id), default)
+
+    manager = ChannelScheduleManager()
+
+    def to_timestamp(value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value).timestamp()
+        except Exception:
+            return None
+
+    def channel_cooldown_seconds(ch):
+        try:
+            sd = getattr(ch, "slowmode_delay", None)
+            return int(sd) if sd else 60
+        except Exception:
+            return 60
+
+    def compute_next_ts(ch, last_sent_ts=None):
+        base = time.time() if last_sent_ts is None else last_sent_ts
+        return base + channel_cooldown_seconds(ch)
+
+    def get_last_sent_ts(channel_id, record=None):
+        entry = record
+        if entry is None:
+            data = load_data()
+            target = str(channel_id)
+            entry = next((tc for tc in data.get("trade_channels", []) if str(tc.get("id")) == target), None)
+        if not entry:
+            return None
+        return to_timestamp(entry.get("last_sent"))
+
+    def get_cooldown_until_ts(record):
+        if not record:
+            return None
+        return to_timestamp(record.get("cooldown_until"))
+
+    def schedule_channel(ch, record):
+        if not ch or not record:
+            return
+
+        cid = record.get("id") or getattr(ch, "id", None)
+        if not cid:
+            return
+
+        last_sent_ts = get_last_sent_ts(cid, record)
+        if last_sent_ts is None:
+            last_sent_ts = time.time() - channel_cooldown_seconds(ch)
+
+        next_ts = compute_next_ts(ch, last_sent_ts)
+
+        cooldown_until_ts = get_cooldown_until_ts(record)
+        if cooldown_until_ts is not None:
+            next_ts = max(next_ts, cooldown_until_ts)
+
+        manager.schedule(cid, next_ts)
 
     def sanitize_trade_channels(raw_channels):
         if not isinstance(raw_channels, list):
@@ -731,12 +801,7 @@ def blox_fruits_trader():
                     n = ch.name.lower()
                     if any(k in n for k in kw) and not any(n.startswith(e) for e in ex):
                         cid = str(ch.id)
-                        # Determine slowmode-based cooldown; default to 60 only when off/None
-                        try:
-                            sd = getattr(ch, 'slowmode_delay', None)
-                        except Exception:
-                            sd = None
-                        cooldown = int(sd) if sd else 60
+                        cooldown = channel_cooldown_seconds(ch)
 
                         trade_emoji = await find_trade_emoji(g)
 
@@ -753,12 +818,14 @@ def blox_fruits_trader():
                             if trade_emoji:
                                 existing["trade_emoji"] = trade_emoji
 
+                            schedule_channel(ch, existing)
+
                             row = build_channel_row(existing)
                             if row:
                                 ch_table.update_rows([row])
                         else:
                             # New entry with actual cooldown
-                            d["trade_channels"].append({
+                            new_entry = {
                                 "id": cid,
                                 "server_id": str(g.id),
                                 "server_name": g.name,
@@ -768,9 +835,13 @@ def blox_fruits_trader():
                                 "last_sent": None,
                                 "trade_emoji": trade_emoji,
                                 "cooldown_until": None
-                            })
+                            }
 
-                            row = build_channel_row(d["trade_channels"][-1])
+                            d["trade_channels"].append(new_entry)
+
+                            schedule_channel(ch, new_entry)
+
+                            row = build_channel_row(new_entry)
                             if row:
                                 ch_table.insert_rows([row])
                             added += 1
