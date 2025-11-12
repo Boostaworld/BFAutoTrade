@@ -128,8 +128,8 @@ def blox_fruits_trader():
         def schedule(self, channel_id, timestamp):
             try:
                 self._schedule[str(channel_id)] = float(timestamp)
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError) as e:
+                print(f"Could not schedule channel {channel_id} with timestamp {timestamp}: {e}", type_="WARNING")
 
         def get(self, channel_id, default=None):
             return self._schedule.get(str(channel_id), default)
