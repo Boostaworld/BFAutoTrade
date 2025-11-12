@@ -277,6 +277,7 @@ def blox_fruits_trader():
     auto_check = ctrl.create_ui_element(UI.Checkbox, label='Auto Send Mode', checked=False)
     start_btn = ctrl.create_ui_element(UI.Button, label='Start', disabled=True, color="success")
     stop_btn = ctrl.create_ui_element(UI.Button, label='Stop', disabled=True, color="danger")
+    test_btn = ctrl.create_ui_element(UI.Button, label='Test Format', color="default")
 
     # Tables
     tables = card.create_group(type="columns", gap=6, full_width=True)
@@ -466,6 +467,31 @@ def blox_fruits_trader():
             return False, f"HTTP error (status={status}, code={code})"
         except Exception as e:
             return False, f"Error: {e}"
+
+    async def send_test_format():
+        print("Sending test format...", type_="INFO")
+        try:
+            d = load_data()
+            if not d["trade_offers"] or not d["trade_requests"]:
+                print("Configure trade first", type_="WARNING")
+                return
+
+            server_id = None
+            if d["trade_channels"]:
+                server_id = d["trade_channels"][0].get("server_id")
+
+            if not server_id:
+                server_id = "0"
+
+            msg = await build_msg(server_id, d["trade_offers"], d["trade_requests"])
+            ok, err = await send_to("1390328683494903978", msg)
+
+            if ok:
+                print("✓ Test format sent to Mee6", type_="SUCCESS")
+            else:
+                print(f"✗ Test format failed: {describe_error(err)}", type_="ERROR")
+        except Exception as e:
+            print(f"Test format error: {e}", type_="ERROR")
 
     # Main Functions
     def sendNowToChannel_sync(row_id):
@@ -1017,6 +1043,7 @@ def blox_fruits_trader():
     save_btn.onClick = save_trade
     start_btn.onClick = start_operation
     stop_btn.onClick = stop_operation
+    test_btn.onClick = lambda: bot.loop.create_task(send_test_format())
 
     # Initialization
     async def init():
