@@ -54,7 +54,7 @@ def blox_fruits_trader():
 
     def describe_suppression(gid):
         key = str(gid)
-        if not is_suppressed(key):
+        if not is_suppressed(gid):
             return None
 
         value = Suppression.get(key)
@@ -825,11 +825,7 @@ def blox_fruits_trader():
                 print("Configure trade first", type_="WARNING")
                 return
 
-            channel = None
-            for tc in d["trade_channels"]:
-                if tc["id"] == cid:
-                    channel = tc
-                    break
+            channel, _ = find_channel_entry(cid, d)
 
             if not channel:
                 print("Channel not found", type_="ERROR")
