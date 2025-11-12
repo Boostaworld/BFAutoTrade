@@ -3,7 +3,7 @@ import asyncio
 import random
 import re
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import discord
 
 @nightyScript(
@@ -84,6 +84,10 @@ def blox_fruits_trader():
 
                 if changed:
                     save_data(data)
+
+                for tc in data.get("trade_channels", []):
+                    if "cooldown_until" not in tc:
+                        tc["cooldown_until"] = None
                 return data
         except:
             return DEFAULT_DATA.copy()
@@ -111,15 +115,40 @@ def blox_fruits_trader():
         except:
             pass
 
-    def get_cooldown_remaining(last_sent, cooldown):
-        if not last_sent:
-            return 0
+    def get_cooldown_remaining(channel):
         try:
-            last = datetime.fromisoformat(last_sent)
-            elapsed = (datetime.now() - last).total_seconds()
-            return max(0, int(cooldown - elapsed))
+            cooldown_val = int(channel.get("cooldown", 60))
         except:
-            return 0
+            cooldown_val = 60
+
+        base_remaining = 0
+        last_sent = channel.get("last_sent")
+        if last_sent:
+            try:
+                last = datetime.fromisoformat(last_sent)
+                elapsed = (datetime.now() - last).total_seconds()
+                base_remaining = max(0, int(cooldown_val - elapsed))
+            except:
+                base_remaining = 0
+
+        extra_remaining = 0
+        cooldown_until = channel.get("cooldown_until")
+        if cooldown_until:
+            try:
+                target = datetime.fromisoformat(cooldown_until)
+                extra_remaining = max(0, int((target - datetime.now()).total_seconds()))
+            except:
+                extra_remaining = 0
+
+        return max(base_remaining, extra_remaining)
+
+    def describe_error(err):
+        if isinstance(err, str):
+            return err
+        try:
+            return json.dumps(err)
+        except TypeError:
+            return str(err)
 
     data = load_data()
     emoji_cache = load_emoji_cache()
@@ -321,8 +350,22 @@ def blox_fruits_trader():
             return True, "OK"
         except discord.errors.Forbidden:
             return False, "No perm"
-        except:
-            return False, "Error"
+        except discord.errors.HTTPException as e:
+            status = getattr(e, "status", None)
+            code = getattr(e, "code", None)
+            retry_after = getattr(e, "retry_after", None)
+
+            if retry_after is not None and (status == 429 or code == 20028):
+                return False, {
+                    "type": "cooldown",
+                    "retry_after": retry_after,
+                    "status": status,
+                    "code": code
+                }
+
+            return False, f"HTTP error (status={status}, code={code})"
+        except Exception as e:
+            return False, f"Error: {e}"
 
     # Main Functions
     def sendNowToChannel_sync(row_id):
@@ -350,11 +393,13 @@ def blox_fruits_trader():
             ok, err = await send_to(channel["id"], msg)
             
             if ok:
-                channel["last_sent"] = datetime.now().isoformat()
+                now = datetime.now()
+                channel["last_sent"] = now.isoformat()
+                channel["cooldown_until"] = None
                 save_data(d)
                 print(f"✓ Sent to {channel['channel_name']}", type_="SUCCESS")
-                
-                rem = get_cooldown_remaining(channel.get("last_sent"), channel.get("cooldown", 60))
+
+                rem = get_cooldown_remaining(channel)
                 st = f"CD: {rem}s" if rem > 0 else "Ready"
                 
                 ch_table.update_rows([{
@@ -367,8 +412,43 @@ def blox_fruits_trader():
                     ]
                 }])
             else:
-                print(f"✗ {channel['channel_name']}: {err}", type_="ERROR")
-                
+                if isinstance(err, dict) and err.get("type") == "cooldown":
+                    try:
+                        retry_seconds = float(err.get("retry_after", 0))
+                    except (TypeError, ValueError):
+                        retry_seconds = 0
+
+                    if retry_seconds > 0:
+                        next_time = datetime.now() + timedelta(seconds=retry_seconds)
+                        channel["cooldown_until"] = next_time.isoformat()
+                        save_data(d)
+
+                        rem = get_cooldown_remaining(channel)
+                        st = f"CD: {rem}s" if rem > 0 else "Ready"
+
+                        ch_table.update_rows([
+                            {
+                                "id": cid,
+                                "cells": [
+                                    {"text": channel.get("channel_name", "?"), "imageUrl": channel.get("server_icon", ""), "subtext": channel.get("server_name", "")},
+                                    {"text": f"{channel.get('cooldown', 60)}s", "subtext": st},
+                                    {"text": st, "subtext": channel.get("last_sent", "Never")[:19]},
+                                    {}
+                                ]
+                            }
+                        ])
+
+                        print(f"⌛ {channel['channel_name']}: retry in {int(retry_seconds)}s", type_="WARNING")
+                        return
+
+                try:
+                    cooldown_val = int(channel.get("cooldown", 60))
+                except:
+                    cooldown_val = 60
+                channel["cooldown_until"] = (datetime.now() + timedelta(seconds=cooldown_val)).isoformat()
+                save_data(d)
+                print(f"✗ {channel['channel_name']}: {describe_error(err)}", type_="ERROR")
+
         except Exception as e:
             print(f"Send error: {e}", type_="ERROR")
     
@@ -444,7 +524,7 @@ def blox_fruits_trader():
                             if trade_emoji:
                                 existing["trade_emoji"] = trade_emoji
 
-                            rem = get_cooldown_remaining(existing.get("last_sent"), existing.get("cooldown", 60))
+                            rem = get_cooldown_remaining(existing)
                             st = f"CD: {rem}s" if rem > 0 else "Ready"
                             ch_table.update_rows([{
                                 "id": cid,
@@ -525,7 +605,8 @@ def blox_fruits_trader():
                     "channel_name": ch.name,
                     "cooldown": cd,
                     "last_sent": None,
-                    "trade_emoji": await find_trade_emoji(g)
+                    "trade_emoji": await find_trade_emoji(g),
+                    "cooldown_until": None
                 })
                 
                 ch_table.insert_rows([{
@@ -614,7 +695,7 @@ def blox_fruits_trader():
                 break
                 
             try:
-                rem = get_cooldown_remaining(c.get("last_sent"), c["cooldown"])
+                rem = get_cooldown_remaining(c)
                 if rem > 0:
                     skip += 1
                     print(f"[{idx}/{total}] Skipped {c['channel_name']} (cooldown: {rem}s)", type_="INFO")
@@ -625,12 +706,32 @@ def blox_fruits_trader():
                 
                 if ok:
                     sent += 1
-                    c["last_sent"] = datetime.now().isoformat()
+                    now = datetime.now()
+                    c["last_sent"] = now.isoformat()
+                    c["cooldown_until"] = None
                     print(f"[{idx}/{total}] ✓ {c['channel_name']}", type_="SUCCESS")
                 else:
                     fail += 1
-                    print(f"[{idx}/{total}] ✗ {c['channel_name']}: {err}", type_="ERROR")
-                
+                    if isinstance(err, dict) and err.get("type") == "cooldown":
+                        try:
+                            retry_seconds = float(err.get("retry_after", 0))
+                        except (TypeError, ValueError):
+                            retry_seconds = 0
+                        if retry_seconds > 0:
+                            next_time = datetime.now() + timedelta(seconds=retry_seconds)
+                            c["cooldown_until"] = next_time.isoformat()
+                            print(f"[{idx}/{total}] ⏳ {c['channel_name']}: retry in {int(retry_seconds)}s", type_="WARNING")
+                        else:
+                            print(f"[{idx}/{total}] ✗ {c['channel_name']}: {describe_error(err)}", type_="ERROR")
+                    else:
+                        try:
+                            cooldown_val = int(c.get("cooldown", 60))
+                        except:
+                            cooldown_val = 60
+                        next_time = datetime.now() + timedelta(seconds=cooldown_val)
+                        c["cooldown_until"] = next_time.isoformat()
+                        print(f"[{idx}/{total}] ✗ {c['channel_name']}: {describe_error(err)}", type_="ERROR")
+
                 await asyncio.sleep(random.uniform(2, 4))
             except Exception as e:
                 fail += 1
@@ -650,8 +751,6 @@ def blox_fruits_trader():
     async def auto_loop():
         print("Auto-send loop startedV3", type_="SUCCESS")
 
-        # Track failed channels and errors
-        failed_channels = {}
         error_log = []
 
         while AutoState.running:
@@ -662,63 +761,73 @@ def blox_fruits_trader():
                     await asyncio.sleep(5)
                     continue
 
-                current_time = datetime.now()
                 sent_this_loop = 0
 
-                # Sort channels by cooldown remaining (lowest first)
                 channels_with_cooldowns = []
                 for c in d["trade_channels"]:
-                    cid = c["id"]
-
-                    # Skip recently failed channels
-                    if cid in failed_channels:
-                        time_since_fail = (current_time - failed_channels[cid]).total_seconds()
-                        if time_since_fail < 30:
-                            continue
-                        else:
-                            del failed_channels[cid]
-
-                    rem = get_cooldown_remaining(c.get("last_sent"), c["cooldown"])
+                    rem = get_cooldown_remaining(c)
                     channels_with_cooldowns.append((rem, c))
 
-                # Sort by cooldown remaining (channels with 0 cooldown first)
                 channels_with_cooldowns.sort(key=lambda x: x[0])
 
-                # Send to channels that are ready (cooldown = 0)
                 for rem, c in channels_with_cooldowns:
                     if not AutoState.running:
                         break
 
                     if rem <= 0:
-                        cid = c["id"]
                         try:
                             msg = await build_msg(c["server_id"], d["trade_offers"], d["trade_requests"], c.get("trade_emoji"))
                             ok, err = await send_to(c["id"], msg)
 
                             if ok:
-                                c["last_sent"] = datetime.now().isoformat()
+                                now = datetime.now()
+                                c["last_sent"] = now.isoformat()
+                                c["cooldown_until"] = None
                                 sent_this_loop += 1
                                 print(f"✓ Auto: {c['channel_name']}", type_="SUCCESS")
-                                if cid in failed_channels:
-                                    del failed_channels[cid]
                             else:
-                                failed_channels[cid] = current_time
-                                error_log.append(f"{c['channel_name']}: {err}")
+                                message = describe_error(err)
+                                if isinstance(err, dict) and err.get("type") == "cooldown":
+                                    try:
+                                        retry_seconds = float(err.get("retry_after", 0))
+                                    except (TypeError, ValueError):
+                                        retry_seconds = 0
+
+                                    if retry_seconds > 0:
+                                        next_time = datetime.now() + timedelta(seconds=retry_seconds)
+                                        c["cooldown_until"] = next_time.isoformat()
+                                        print(f"⌛ Auto: {c['channel_name']} retry in {int(retry_seconds)}s", type_="WARNING")
+                                    else:
+                                        print(f"✗ Auto: {c['channel_name']}: {message}", type_="ERROR")
+                                else:
+                                    try:
+                                        cooldown_val = int(c.get("cooldown", 60))
+                                    except:
+                                        cooldown_val = 60
+                                    next_time = datetime.now() + timedelta(seconds=cooldown_val)
+                                    c["cooldown_until"] = next_time.isoformat()
+                                    print(f"✗ Auto: {c['channel_name']}: {message}", type_="ERROR")
+
+                                error_log.append(f"{c['channel_name']}: {message}")
 
                             await asyncio.sleep(random.uniform(2, 4))
                         except Exception as e:
-                            failed_channels[cid] = current_time
+                            try:
+                                cooldown_val = int(c.get("cooldown", 60))
+                            except:
+                                cooldown_val = 60
+                            next_time = datetime.now() + timedelta(seconds=cooldown_val)
+                            c["cooldown_until"] = next_time.isoformat()
+                            print(f"✗ Auto: {c['channel_name']}: {str(e)}", type_="ERROR")
                             error_log.append(f"{c['channel_name']}: {str(e)}")
 
                 save_data(d)
 
-                # Find the minimum wait time from all channels
                 min_wait = float('inf')
-                for rem, c in channels_with_cooldowns:
+                for rem, _ in channels_with_cooldowns:
                     if rem < min_wait:
                         min_wait = rem
 
-                # Wait until the next channel is ready
                 if sent_this_loop > 0:
                     wait_time = 1
                 elif min_wait != float('inf') and min_wait > 0:
@@ -815,7 +924,7 @@ def blox_fruits_trader():
         
         for c in d["trade_channels"]:
             try:
-                rem = get_cooldown_remaining(c.get("last_sent"), c.get("cooldown", 60))
+                rem = get_cooldown_remaining(c)
                 st = f"CD: {rem}s" if rem > 0 else "Ready"
                 
                 ch_table.insert_rows([{
