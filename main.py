@@ -36,11 +36,66 @@ def blox_fruits_trader():
     COLON_EMOJI_PATTERN = re.compile(r'^:[^:\s]+:$')
     COMPOUND_SPLIT_PATTERN = re.compile(r'([~])')
     SEPARATOR_TOKENS = {"~"}
+    SIMPLE_WORD_PATTERN = re.compile(r'^[A-Za-z]+$')
+
+    def singularize_token(token):
+        if not token:
+            return token
+
+        if not SIMPLE_WORD_PATTERN.fullmatch(token):
+            return token
+
+        lower = token.lower()
+
+        base = None
+        if lower.endswith("ies") and len(token) > 3:
+            base = lower[:-3] + "y"
+        elif lower.endswith(("ses", "xes", "zes", "ches", "shes")):
+            base = lower[:-2]
+        elif lower.endswith("s") and not lower.endswith("ss"):
+            base = lower[:-1]
+
+        if not base:
+            return token
+
+        if token.isupper():
+            return base.upper()
+        if token[0].isupper() and token[1:].islower():
+            return base.capitalize()
+        return base
 
     def parse_trade_input(raw):
         if not raw:
             return []
-        return TOKEN_PATTERN.findall(raw)
+
+        tokens = TOKEN_PATTERN.findall(raw)
+        if not tokens:
+            return []
+
+        expanded = []
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+
+            if token.isdigit() and i + 1 < len(tokens):
+                try:
+                    count = int(token)
+                except ValueError:
+                    count = 0
+
+                if count > 0:
+                    next_token = tokens[i + 1]
+                    if next_token not in SEPARATOR_TOKENS:
+                        base_token = singularize_token(next_token)
+                        if base_token and base_token not in SEPARATOR_TOKENS and not base_token.isdigit():
+                            expanded.extend([base_token] * count)
+                            i += 2
+                            continue
+
+            expanded.append(token)
+            i += 1
+
+        return expanded
 
     def normalize_trade_entries(values):
         if not isinstance(values, list):
@@ -370,6 +425,9 @@ def blox_fruits_trader():
         if not term:
             return None
 
+        normalized_term = singularize_token(term)
+        lookup_term = normalized_term or term
+
         if looks_like_literal_emoji(term):
             return term
 
@@ -378,15 +436,19 @@ def blox_fruits_trader():
             if combined:
                 return combined
 
-        if term.lower() == "or":
+        if lookup_term.lower() == "or":
             g = bot.get_guild(int(gid))
             return await find_or_emoji(g) if g else "🔁"
 
         gs = str(gid)
-        tl = term.lower()
+        tl = lookup_term.lower()
+        original_lower = term.lower()
 
-        if gs in emoji_cache and tl in emoji_cache[gs]:
-            return emoji_cache[gs][tl]
+        if gs in emoji_cache:
+            if tl in emoji_cache[gs]:
+                return emoji_cache[gs][tl]
+            if original_lower != tl and original_lower in emoji_cache[gs]:
+                return emoji_cache[gs][original_lower]
 
         try:
             g = bot.get_guild(int(gid))
@@ -399,6 +461,8 @@ def blox_fruits_trader():
                     if gs not in emoji_cache:
                         emoji_cache[gs] = {}
                     emoji_cache[gs][tl] = es
+                    if original_lower != tl:
+                        emoji_cache[gs][original_lower] = es
                     save_emoji_cache(emoji_cache)
                     return es
 
@@ -410,6 +474,8 @@ def blox_fruits_trader():
                             if gs not in emoji_cache:
                                 emoji_cache[gs] = {}
                             emoji_cache[gs][tl] = es
+                            if original_lower != tl:
+                                emoji_cache[gs][original_lower] = es
                             save_emoji_cache(emoji_cache)
                             return es
             return None
