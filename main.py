@@ -1,6 +1,7 @@
 import json
 import asyncio
 import random
+import re
 from pathlib import Path
 from datetime import datetime
 import discord
@@ -29,6 +30,33 @@ def blox_fruits_trader():
         "buddha": ["budha"], "phoenix": ["phenix", "pheonix"]
     }
 
+    TOKEN_PATTERN = re.compile(r'<a?:[^:]+:\d+>|:[^:\s]+:|[^,\s]+')
+    LITERAL_EMOJI_PATTERN = re.compile(r'^<a?:[^:]+:\d+>$')
+    COLON_EMOJI_PATTERN = re.compile(r'^:[^:\s]+:$')
+    COMPOUND_SPLIT_PATTERN = re.compile(r'([~])')
+    SEPARATOR_TOKENS = {"~"}
+
+    def parse_trade_input(raw):
+        if not raw:
+            return []
+        return TOKEN_PATTERN.findall(raw)
+
+    def normalize_trade_entries(values):
+        if not isinstance(values, list):
+            return []
+
+        normalized = []
+        for value in values:
+            if isinstance(value, str):
+                normalized.extend(parse_trade_input(value))
+            elif value is not None:
+                normalized.append(str(value))
+
+        return [v for v in normalized if v]
+
+    def looks_like_literal_emoji(token):
+        return bool(LITERAL_EMOJI_PATTERN.match(token) or COLON_EMOJI_PATTERN.match(token))
+
     class AutoState:
         running = False
         batch_running = False
@@ -42,6 +70,20 @@ def blox_fruits_trader():
                 for k, v in DEFAULT_DATA.items():
                     if k not in data:
                         data[k] = v
+
+                normalized_offers = normalize_trade_entries(data.get("trade_offers", []))
+                normalized_requests = normalize_trade_entries(data.get("trade_requests", []))
+
+                changed = False
+                if normalized_offers != data.get("trade_offers"):
+                    data["trade_offers"] = normalized_offers
+                    changed = True
+                if normalized_requests != data.get("trade_requests"):
+                    data["trade_requests"] = normalized_requests
+                    changed = True
+
+                if changed:
+                    save_data(data)
                 return data
         except:
             return DEFAULT_DATA.copy()
@@ -140,22 +182,57 @@ def blox_fruits_trader():
         except:
             return "🔁"
 
+    async def resolve_compound_token(gid, term):
+        parts = COMPOUND_SPLIT_PATTERN.split(term)
+        resolved = []
+        any_found = False
+
+        for part in parts:
+            if not part:
+                continue
+            if COMPOUND_SPLIT_PATTERN.fullmatch(part):
+                resolved.append(part)
+                continue
+
+            sub = await fetch_emoji(gid, part)
+            if sub:
+                resolved.append(sub)
+                any_found = True
+            else:
+                resolved.append(part)
+
+        if any_found:
+            return "".join(resolved)
+        return None
+
     async def fetch_emoji(gid, term):
+        term = term.strip()
+        if not term:
+            return None
+
+        if looks_like_literal_emoji(term):
+            return term
+
+        if COMPOUND_SPLIT_PATTERN.search(term):
+            combined = await resolve_compound_token(gid, term)
+            if combined:
+                return combined
+
         if term.lower() == "or":
             g = bot.get_guild(int(gid))
             return await find_or_emoji(g) if g else "🔁"
-        
+
         gs = str(gid)
-        tl = term.lower().strip()
-        
+        tl = term.lower()
+
         if gs in emoji_cache and tl in emoji_cache[gs]:
             return emoji_cache[gs][tl]
-        
+
         try:
             g = bot.get_guild(int(gid))
             if not g:
                 return None
-            
+
             for e in g.emojis:
                 if tl in e.name.lower():
                     es = f"<:{e.name}:{e.id}>" if not e.animated else f"<a:{e.name}:{e.id}>"
@@ -164,7 +241,7 @@ def blox_fruits_trader():
                     emoji_cache[gs][tl] = es
                     save_emoji_cache(emoji_cache)
                     return es
-            
+
             if tl in FRUIT_ALIASES:
                 for alias in FRUIT_ALIASES[tl]:
                     for e in g.emojis:
@@ -183,17 +260,25 @@ def blox_fruits_trader():
         g = bot.get_guild(int(gid))
         if not te:
             te = await find_trade_emoji(g) if g else "↔️"
-        
+
         oe = []
         for o in offers:
+            if o in SEPARATOR_TOKENS:
+                oe.append(o)
+                continue
+
             e = await fetch_emoji(gid, o.strip())
             oe.append(e if e else f"`{o.strip()}`")
-        
+
         re = []
         for r in requests:
+            if r in SEPARATOR_TOKENS:
+                re.append(r)
+                continue
+
             e = await fetch_emoji(gid, r.strip())
             re.append(e if e else f"`{r.strip()}`")
-        
+
         return f"{' '.join(oe)} {te} {' '.join(re)}"
 
     async def send_to(cid, msg):
@@ -403,8 +488,8 @@ def blox_fruits_trader():
         save_btn.loading = True
         d = load_data()
         
-        offers = [o.strip() for o in off_in.value.split(",") if o.strip()]
-        requests = [r.strip() for r in req_in.value.split(",") if r.strip()]
+        offers = parse_trade_input(off_in.value)
+        requests = parse_trade_input(req_in.value)
         
         d["trade_offers"] = offers
         d["trade_requests"] = requests
@@ -415,9 +500,9 @@ def blox_fruits_trader():
             tr_table.delete_rows(ex)
         
         if offers:
-            tr_table.insert_rows([{"id": "o", "cells": [{"text": f"Offering: {', '.join(offers)}"}]}])
+            tr_table.insert_rows([{"id": "o", "cells": [{"text": f"Offering: {' '.join(offers)}"}]}])
         if requests:
-            tr_table.insert_rows([{"id": "r", "cells": [{"text": f"Requesting: {', '.join(requests)}"}]}])
+            tr_table.insert_rows([{"id": "r", "cells": [{"text": f"Requesting: {' '.join(requests)}"}]}])
         
         print(f"Saved: {len(offers)} offers, {len(requests)} requests", type_="SUCCESS")
         
@@ -677,11 +762,11 @@ def blox_fruits_trader():
                 pass
         
         if d.get("trade_offers") and d.get("trade_requests"):
-            off_in.value = ", ".join(d["trade_offers"])
-            req_in.value = ", ".join(d["trade_requests"])
-            
-            tr_table.insert_rows([{"id": "o", "cells": [{"text": f"Offering: {', '.join(d['trade_offers'])}"}]}])
-            tr_table.insert_rows([{"id": "r", "cells": [{"text": f"Requesting: {', '.join(d['trade_requests'])}"}]}])
+            off_in.value = " ".join(d["trade_offers"])
+            req_in.value = " ".join(d["trade_requests"])
+
+            tr_table.insert_rows([{"id": "o", "cells": [{"text": f"Offering: {' '.join(d['trade_offers'])}"}]}])
+            tr_table.insert_rows([{"id": "r", "cells": [{"text": f"Requesting: {' '.join(d['trade_requests'])}"}]}])
             
             # Enable start button if we have channels
             if d["trade_channels"]:
