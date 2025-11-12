@@ -141,14 +141,14 @@ def blox_fruits_trader():
             return None
         try:
             return datetime.fromisoformat(value).timestamp()
-        except Exception:
+        except ValueError:
             return None
 
     def channel_cooldown_seconds(ch):
         try:
             sd = getattr(ch, "slowmode_delay", None)
-            return int(sd) if sd else 60
-        except Exception:
+            return int(sd) if sd is not None else 60
+        except (ValueError, TypeError):
             return 60
 
     def compute_next_ts(ch, last_sent_ts=None):
