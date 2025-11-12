@@ -426,7 +426,7 @@ def blox_fruits_trader():
             return None
 
         normalized_term = singularize_token(term)
-        lookup_term = normalized_term or term
+        lookup_term = normalized_term
 
         if looks_like_literal_emoji(term):
             return term
