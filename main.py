@@ -18,11 +18,12 @@ def blox_fruits_trader():
     EMOJI_CACHE_FILE = BASE_DIR / "guild_emojis.json"
     BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-    DEFAULT_DATA = {
-        "trade_channels": [],
-        "trade_offers": [],
-        "trade_requests": []
-    }
+    def make_default_data():
+        return {
+            "trade_channels": [],
+            "trade_offers": [],
+            "trade_requests": []
+        }
 
     FRUIT_ALIASES = {
         "leopard": ["tiger"], "rumble": ["lightning"], "spirit": ["soul"],
@@ -63,34 +64,133 @@ def blox_fruits_trader():
         task = None
         should_stop = False
 
+    def sanitize_trade_channels(raw_channels):
+        if not isinstance(raw_channels, list):
+            return [], bool(raw_channels)
+
+        cleaned = []
+        seen_ids = set()
+        changed = False
+
+        for entry in reversed(raw_channels):
+            if not isinstance(entry, dict):
+                changed = True
+                continue
+
+            cid_raw = entry.get("id") or entry.get("channel_id")
+            if cid_raw is None:
+                changed = True
+                continue
+
+            cid = str(cid_raw).strip()
+            if not cid or cid in seen_ids:
+                changed = True
+                continue
+
+            server_id = entry.get("server_id") or entry.get("guild_id")
+            server_id = str(server_id).strip() if server_id else None
+            if not server_id:
+                changed = True
+                continue
+
+            channel_name = entry.get("channel_name") or entry.get("name") or ""
+            if not isinstance(channel_name, str):
+                channel_name = str(channel_name)
+            channel_name = channel_name.strip()
+            if not channel_name:
+                changed = True
+                continue
+
+            server_name = entry.get("server_name") or entry.get("guild_name") or ""
+            if not isinstance(server_name, str):
+                server_name = str(server_name)
+
+            server_icon = entry.get("server_icon") or ""
+            if not isinstance(server_icon, str):
+                server_icon = str(server_icon)
+
+            try:
+                cooldown = int(entry.get("cooldown", 60))
+            except (TypeError, ValueError):
+                cooldown = 60
+            if cooldown < 0:
+                cooldown = 60
+
+            last_sent = entry.get("last_sent") if isinstance(entry.get("last_sent"), str) else None
+            cooldown_until = entry.get("cooldown_until") if isinstance(entry.get("cooldown_until"), str) else None
+
+            trade_emoji = entry.get("trade_emoji")
+            if trade_emoji is not None and not isinstance(trade_emoji, str):
+                trade_emoji = str(trade_emoji)
+
+            sanitized_entry = {
+                "id": cid,
+                "server_id": server_id,
+                "server_name": server_name,
+                "server_icon": server_icon,
+                "channel_name": channel_name,
+                "cooldown": cooldown,
+                "last_sent": last_sent,
+                "trade_emoji": trade_emoji,
+                "cooldown_until": cooldown_until,
+            }
+
+            base_compare = {
+                "id": entry.get("id"),
+                "server_id": entry.get("server_id"),
+                "server_name": entry.get("server_name"),
+                "server_icon": entry.get("server_icon"),
+                "channel_name": entry.get("channel_name"),
+                "cooldown": entry.get("cooldown"),
+                "last_sent": entry.get("last_sent"),
+                "trade_emoji": entry.get("trade_emoji"),
+                "cooldown_until": entry.get("cooldown_until"),
+            }
+
+            if any(sanitized_entry[key] != base_compare.get(key) for key in sanitized_entry):
+                changed = True
+
+            cleaned.append(sanitized_entry)
+            seen_ids.add(cid)
+
+        cleaned.reverse()
+        return cleaned, changed
+
     def load_data():
+        load_failed = False
         try:
             with open(DATA_FILE, "r") as f:
-                data = json.load(f)
-                for k, v in DEFAULT_DATA.items():
-                    if k not in data:
-                        data[k] = v
-
-                normalized_offers = normalize_trade_entries(data.get("trade_offers", []))
-                normalized_requests = normalize_trade_entries(data.get("trade_requests", []))
-
-                changed = False
-                if normalized_offers != data.get("trade_offers"):
-                    data["trade_offers"] = normalized_offers
-                    changed = True
-                if normalized_requests != data.get("trade_requests"):
-                    data["trade_requests"] = normalized_requests
-                    changed = True
-
-                if changed:
-                    save_data(data)
-
-                for tc in data.get("trade_channels", []):
-                    if "cooldown_until" not in tc:
-                        tc["cooldown_until"] = None
-                return data
+                raw = json.load(f)
         except:
-            return DEFAULT_DATA.copy()
+            raw = {}
+            load_failed = True
+
+        data = make_default_data()
+        changed = load_failed
+
+        sanitized_channels, channels_changed = sanitize_trade_channels(raw.get("trade_channels"))
+        data["trade_channels"] = sanitized_channels
+        changed = changed or channels_changed
+
+        normalized_offers = normalize_trade_entries(raw.get("trade_offers", []))
+        normalized_requests = normalize_trade_entries(raw.get("trade_requests", []))
+
+        if normalized_offers != raw.get("trade_offers"):
+            changed = True
+        if normalized_requests != raw.get("trade_requests"):
+            changed = True
+
+        data["trade_offers"] = normalized_offers
+        data["trade_requests"] = normalized_requests
+
+        for tc in data.get("trade_channels", []):
+            if "cooldown_until" not in tc:
+                tc["cooldown_until"] = None
+
+        if changed:
+            save_data(data)
+
+        return data
 
     def save_data(data):
         try:
