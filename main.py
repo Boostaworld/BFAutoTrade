@@ -709,7 +709,16 @@ def blox_fruits_trader():
         except Exception as e:
             print(f"Test format error: {e}", type_="ERROR")
 
-    # Main Functions
+    # Button/Row Action Wrappers
+    def handle_detect():
+        bot.loop.create_task(detect())
+
+    def handle_test():
+        bot.loop.create_task(send_test_format())
+
+    def handle_add():
+        bot.loop.create_task(add())
+
     def sendNowToChannel_sync(row_id):
         bot.loop.create_task(sendNowToChannel(row_id))
     
@@ -809,6 +818,84 @@ def blox_fruits_trader():
         except Exception as e:
             print(f"Remove error: {e}", type_="ERROR")
 
+    async def discover_trade_channels():
+        d = load_data()
+        kw = ["trading", "slow-trading", "fast-trading", "trade-chat", "trades", "trade"]
+        ex = ["pvb", "sab"]
+
+        new_channels = []
+        updated_channels = []
+
+        for g in bot.guilds:
+            for ch in g.text_channels:
+                name_lower = ch.name.lower()
+                if not any(k in name_lower for k in kw) or any(name_lower.startswith(e) for e in ex):
+                    continue
+
+                cid = str(ch.id)
+
+                try:
+                    slowmode_delay = getattr(ch, "slowmode_delay", None)
+                except Exception:
+                    slowmode_delay = None
+
+                cooldown = int(slowmode_delay) if slowmode_delay else 60
+                trade_emoji = await find_trade_emoji(g)
+
+                existing = next((tc for tc in d["trade_channels"] if tc["id"] == cid), None)
+
+                if existing:
+                    changed = False
+
+                    if existing.get("cooldown") != cooldown:
+                        existing["cooldown"] = cooldown
+                        changed = True
+
+                    server_icon = str(g.icon.url) if g.icon else ""
+
+                    if existing.get("server_id") != str(g.id):
+                        existing["server_id"] = str(g.id)
+                        changed = True
+
+                    if existing.get("server_name") != g.name:
+                        existing["server_name"] = g.name
+                        changed = True
+
+                    if existing.get("server_icon") != server_icon:
+                        existing["server_icon"] = server_icon
+                        changed = True
+
+                    if existing.get("channel_name") != ch.name:
+                        existing["channel_name"] = ch.name
+                        changed = True
+
+                    if trade_emoji and existing.get("trade_emoji") != trade_emoji:
+                        existing["trade_emoji"] = trade_emoji
+                        changed = True
+
+                    if changed:
+                        updated_channels.append(existing)
+                else:
+                    channel_entry = {
+                        "id": cid,
+                        "server_id": str(g.id),
+                        "server_name": g.name,
+                        "server_icon": str(g.icon.url) if g.icon else "",
+                        "channel_name": ch.name,
+                        "cooldown": cooldown,
+                        "last_sent": None,
+                        "trade_emoji": trade_emoji,
+                        "cooldown_until": None,
+                    }
+
+                    d["trade_channels"].append(channel_entry)
+                    new_channels.append(channel_entry)
+
+        if new_channels or updated_channels:
+            save_data(d)
+
+        return new_channels, updated_channels
+
     initial_channel_rows = []
     for channel in data.get("trade_channels", []):
         row = build_channel_row(channel)
@@ -829,85 +916,35 @@ def blox_fruits_trader():
     )
 
     async def detect():
-        det_btn.loading = True
-        det_btn.disabled = True
+        det_btn.loading = True; det_btn.disabled = True
         try:
-            d = load_data()
-            added = 0
-            updated = 0
-            kw = ["trading", "slow-trading", "fast-trading", "trade-chat", "trades", "trade"]
-            ex = ["pvb", "sab"]
-            
-            print("Scanning servers for trading channels...", type_="INFO")
-            
-            for g in bot.guilds:
-                for ch in g.text_channels:
-                    n = ch.name.lower()
-                    if any(k in n for k in kw) and not any(n.startswith(e) for e in ex):
-                        cid = str(ch.id)
-                        # Determine slowmode-based cooldown; default to 60 only when off/None
-                        try:
-                            sd = getattr(ch, 'slowmode_delay', None)
-                        except Exception:
-                            sd = None
-                        cooldown = int(sd) if sd else 60
+            rows_to_insert = []
+            rows_to_update = []
 
-                        trade_emoji = await find_trade_emoji(g)
+            new_channels, updated_channels = await discover_trade_channels()
 
-                        existing = next((tc for tc in d["trade_channels"] if tc["id"] == cid), None)
-                        if existing:
-                            # Refresh cooldown and metadata so auto-send respects actual timing
-                            if existing.get("cooldown") != cooldown:
-                                existing["cooldown"] = cooldown
-                                updated += 1
-                            existing["server_id"] = str(g.id)
-                            existing["server_name"] = g.name
-                            existing["server_icon"] = str(g.icon.url) if g.icon else ""
-                            existing["channel_name"] = ch.name
-                            if trade_emoji:
-                                existing["trade_emoji"] = trade_emoji
+            for channel in new_channels:
+                row = build_channel_row(channel)
+                if row:
+                    rows_to_insert.append(row)
 
-                            row = build_channel_row(existing)
-                            if row:
-                                ch_table.update_rows([row])
+            for channel in updated_channels:
+                row = build_channel_row(channel)
+                if row:
+                    rows_to_update.append(row)
 
-                            if AutoState.running and manager:
-                                schedule_channel(existing)
-                        else:
-                            # New entry with actual cooldown
-                            d["trade_channels"].append({
-                                "id": cid,
-                                "server_id": str(g.id),
-                                "server_name": g.name,
-                                "server_icon": str(g.icon.url) if g.icon else "",
-                                "channel_name": ch.name,
-                                "cooldown": cooldown,
-                                "last_sent": None,
-                                "trade_emoji": trade_emoji,
-                                "cooldown_until": None
-                            })
+            if rows_to_update:
+                ch_table.update_rows(rows_to_update)
 
-                            row = build_channel_row(d["trade_channels"][-1])
-                            if row:
-                                ch_table.insert_rows([row])
-                            if AutoState.running and manager:
-                                schedule_channel(d["trade_channels"][-1])
-                            added += 1
-                            print(f"Found: {ch.name} in {g.name}", type_="SUCCESS")
-            
-            save_data(d)
-            print(f"✓ Detection complete: Found {added} new trading channels", type_="SUCCESS")
-            
-            # Enable start button if we have channels and trade configured and auto-send isn't active
-            start_btn.disabled = AutoState.running or not (
-                d["trade_channels"] and d["trade_offers"] and d["trade_requests"]
-            )
-                
+            if rows_to_insert:
+                ch_table.insert_rows(rows_to_insert)
+
+            total_detected = len(rows_to_insert) + len(rows_to_update)
+            print(f"✓ Detected {total_detected} channels", type_="SUCCESS")
         except Exception as e:
-            print(f"Detect failed: {e}", type_="ERROR")
+            print(f"✗ Detect failed: {describe_error(e)}", type_="ERROR")
         finally:
-            det_btn.loading = False
-            det_btn.disabled = False
+            det_btn.loading = False; det_btn.disabled = False
 
     async def add():
         add_btn.loading = True
@@ -1193,13 +1230,13 @@ def blox_fruits_trader():
     auto_check.onChange = lambda v: bot.loop.create_task(handle_auto_toggle(v))
     off_in.onInput = on_off_input
     req_in.onInput = on_req_input
-
-    add_btn.onClick = lambda: bot.loop.create_task(add())
-    det_btn.onClick = lambda: bot.loop.create_task(detect())
+    
+    add_btn.onClick = handle_add
+    det_btn.onClick = handle_detect
     save_btn.onClick = save_trade
     start_btn.onClick = start_operation
     stop_btn.onClick = stop_operation
-    test_btn.onClick = lambda: bot.loop.create_task(send_test_format())
+    test_btn.onClick = handle_test
 
     # Initialization
     async def init():
