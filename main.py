@@ -28,7 +28,8 @@ def blox_fruits_trader():
     FRUIT_ALIASES = {
         "leopard": ["tiger"], "rumble": ["lightning"], "spirit": ["soul"],
         "t-rex": ["trex", "rex"], "control": ["kage"], "dough": ["doughnut"],
-        "buddha": ["budha"], "phoenix": ["phenix", "pheonix"]
+        "buddha": ["budha"], "phoenix": ["phenix", "pheonix"],
+        "storage": ["capacity"], "storages": ["capacity"],
     }
 
     TOKEN_PATTERN = re.compile(r'<a?:[^:]+:\d+>|:[^:\s]+:|[^,\s]+')
@@ -51,7 +52,6 @@ def blox_fruits_trader():
         if lower.endswith("ies") and len(token) > 3:
             base = lower[:-3] + "y"
         elif lower.endswith(("ses", "xes", "zes", "ches", "shes")):
-            # Trim the trailing "es" for cases like "gases" → "gas" or "boxes" → "box".
             base = lower[:-2]
         elif lower.endswith("s") and not lower.endswith("ss"):
             base = lower[:-1]
@@ -298,6 +298,39 @@ def blox_fruits_trader():
 
         return max(base_remaining, extra_remaining)
 
+    def build_channel_row(channel):
+        try:
+            cid = str(channel.get("id", "")).strip()
+        except Exception:
+            cid = ""
+
+        if not cid:
+            return None
+
+        try:
+            cooldown_val = int(channel.get("cooldown", 60))
+        except (TypeError, ValueError):
+            cooldown_val = 60
+
+        remaining = get_cooldown_remaining(channel)
+        status = f"CD: {remaining}s" if remaining > 0 else "Ready"
+        last_sent = channel.get("last_sent") or "Never"
+        last_sent = str(last_sent)[:19]
+
+        return {
+            "id": cid,
+            "cells": [
+                {
+                    "text": channel.get("channel_name", "?"),
+                    "imageUrl": channel.get("server_icon", ""),
+                    "subtext": channel.get("server_name", ""),
+                },
+                {"text": f"{cooldown_val}s", "subtext": status},
+                {"text": status, "subtext": last_sent},
+                {},
+            ],
+        }
+
     def describe_error(err):
         if isinstance(err, str):
             return err
@@ -308,6 +341,23 @@ def blox_fruits_trader():
 
     data = load_data()
     emoji_cache = load_emoji_cache()
+
+    # Ensure new aliases bypass any stale cache entries so they resolve immediately.
+    CACHE_PURGE_KEYS = {"storage", "storages"}
+    cache_purged = False
+    for guild_id, entries in list(emoji_cache.items()):
+        if not isinstance(entries, dict):
+            emoji_cache[guild_id] = {}
+            cache_purged = True
+            continue
+
+        for key in CACHE_PURGE_KEYS:
+            if key in entries:
+                del entries[key]
+                cache_purged = True
+
+    if cache_purged:
+        save_emoji_cache(emoji_cache)
 
     # UI
     tab = Tab(name='BF Trader', title="Blox Fruits Trader", icon="convert")
@@ -333,6 +383,7 @@ def blox_fruits_trader():
     auto_check = ctrl.create_ui_element(UI.Checkbox, label='Auto Send Mode', checked=False)
     start_btn = ctrl.create_ui_element(UI.Button, label='Start', disabled=True, color="success")
     stop_btn = ctrl.create_ui_element(UI.Button, label='Stop', disabled=True, color="danger")
+    test_btn = ctrl.create_ui_element(UI.Button, label='Test Format', color="default")
 
     # Tables
     tables = card.create_group(type="columns", gap=6, full_width=True)
@@ -427,7 +478,7 @@ def blox_fruits_trader():
             return None
 
         normalized_term = singularize_token(term)
-        lookup_term = normalized_term or term
+        lookup_term = normalized_term
 
         if looks_like_literal_emoji(term):
             return term
@@ -534,6 +585,31 @@ def blox_fruits_trader():
         except Exception as e:
             return False, f"Error: {e}"
 
+    async def send_test_format():
+        print("Sending test format...", type_="INFO")
+        try:
+            d = load_data()
+            if not d["trade_offers"] or not d["trade_requests"]:
+                print("Configure trade first", type_="WARNING")
+                return
+
+            server_id = None
+            if d["trade_channels"]:
+                server_id = d["trade_channels"][0].get("server_id")
+
+            if not server_id:
+                server_id = "0"
+
+            msg = await build_msg(server_id, d["trade_offers"], d["trade_requests"])
+            ok, err = await send_to("1390328683494903978", msg)
+
+            if ok:
+                print("✓ Test format sent to Mee6", type_="SUCCESS")
+            else:
+                print(f"✗ Test format failed: {describe_error(err)}", type_="ERROR")
+        except Exception as e:
+            print(f"Test format error: {e}", type_="ERROR")
+
     # Main Functions
     def sendNowToChannel_sync(row_id):
         bot.loop.create_task(sendNowToChannel(row_id))
@@ -566,18 +642,9 @@ def blox_fruits_trader():
                 save_data(d)
                 print(f"✓ Sent to {channel['channel_name']}", type_="SUCCESS")
 
-                rem = get_cooldown_remaining(channel)
-                st = f"CD: {rem}s" if rem > 0 else "Ready"
-                
-                ch_table.update_rows([{
-                    "id": cid,
-                    "cells": [
-                        {"text": channel.get("channel_name", "?"), "imageUrl": channel.get("server_icon", ""), "subtext": channel.get("server_name", "")},
-                        {"text": f"{channel.get('cooldown', 60)}s", "subtext": st},
-                        {"text": st, "subtext": channel.get("last_sent", "Never")[:19]},
-                        {}
-                    ]
-                }])
+                row = build_channel_row(channel)
+                if row:
+                    ch_table.update_rows([row])
             else:
                 if isinstance(err, dict) and err.get("type") == "cooldown":
                     try:
@@ -590,20 +657,9 @@ def blox_fruits_trader():
                         channel["cooldown_until"] = next_time.isoformat()
                         save_data(d)
 
-                        rem = get_cooldown_remaining(channel)
-                        st = f"CD: {rem}s" if rem > 0 else "Ready"
-
-                        ch_table.update_rows([
-                            {
-                                "id": cid,
-                                "cells": [
-                                    {"text": channel.get("channel_name", "?"), "imageUrl": channel.get("server_icon", ""), "subtext": channel.get("server_name", "")},
-                                    {"text": f"{channel.get('cooldown', 60)}s", "subtext": st},
-                                    {"text": st, "subtext": channel.get("last_sent", "Never")[:19]},
-                                    {}
-                                ]
-                            }
-                        ])
+                        row = build_channel_row(channel)
+                        if row:
+                            ch_table.update_rows([row])
 
                         print(f"⌛ {channel['channel_name']}: retry in {int(retry_seconds)}s", type_="WARNING")
                         return
@@ -639,6 +695,12 @@ def blox_fruits_trader():
         except Exception as e:
             print(f"Remove error: {e}", type_="ERROR")
 
+    initial_channel_rows = []
+    for channel in data.get("trade_channels", []):
+        row = build_channel_row(channel)
+        if row:
+            initial_channel_rows.append(row)
+
     ch_table = tables.create_ui_element(
         UI.Table, selectable=False, search=True, items_per_page=10,
         columns=[
@@ -649,7 +711,7 @@ def blox_fruits_trader():
                 {"label": "Send Now", "color": "default", "onClick": sendNowToChannel_sync},
                 {"label": "Remove", "color": "danger", "onClick": removeChannel_sync}
             ]}
-        ], rows=[]
+        ], rows=initial_channel_rows
     )
 
     async def detect():
@@ -691,17 +753,9 @@ def blox_fruits_trader():
                             if trade_emoji:
                                 existing["trade_emoji"] = trade_emoji
 
-                            rem = get_cooldown_remaining(existing)
-                            st = f"CD: {rem}s" if rem > 0 else "Ready"
-                            ch_table.update_rows([{
-                                "id": cid,
-                                "cells": [
-                                    {"text": ch.name, "imageUrl": str(g.icon.url) if g.icon else "", "subtext": g.name},
-                                    {"text": f"{cooldown}s", "subtext": st},
-                                    {"text": st, "subtext": (existing.get("last_sent") or "Never")[:19]},
-                                    {}
-                                ]
-                            }])
+                            row = build_channel_row(existing)
+                            if row:
+                                ch_table.update_rows([row])
                         else:
                             # New entry with actual cooldown
                             d["trade_channels"].append({
@@ -712,18 +766,13 @@ def blox_fruits_trader():
                                 "channel_name": ch.name,
                                 "cooldown": cooldown,
                                 "last_sent": None,
-                                "trade_emoji": trade_emoji
+                                "trade_emoji": trade_emoji,
+                                "cooldown_until": None
                             })
-                            
-                            ch_table.insert_rows([{
-                                "id": cid,
-                                "cells": [
-                                    {"text": ch.name, "imageUrl": str(g.icon.url) if g.icon else "", "subtext": g.name},
-                                    {"text": f"{cooldown}s", "subtext": "Ready"},
-                                    {"text": "Ready", "subtext": "Never"},
-                                    {}
-                                ]
-                            }])
+
+                            row = build_channel_row(d["trade_channels"][-1])
+                            if row:
+                                ch_table.insert_rows([row])
                             added += 1
                             print(f"Found: {ch.name} in {g.name}", type_="SUCCESS")
             
@@ -776,15 +825,9 @@ def blox_fruits_trader():
                     "cooldown_until": None
                 })
                 
-                ch_table.insert_rows([{
-                    "id": cid,
-                    "cells": [
-                        {"text": ch.name, "imageUrl": str(g.icon.url) if g.icon else "", "subtext": g.name},
-                        {"text": f"{cd}s", "subtext": "Ready"},
-                        {"text": "Ready", "subtext": "Never"},
-                        {}
-                    ]
-                }])
+                row = build_channel_row(d["trade_channels"][-1])
+                if row:
+                    ch_table.insert_rows([row])
             
             save_data(d)
             print(f"Added channels", type_="SUCCESS")
@@ -1084,27 +1127,20 @@ def blox_fruits_trader():
     save_btn.onClick = save_trade
     start_btn.onClick = start_operation
     stop_btn.onClick = stop_operation
+    test_btn.onClick = lambda: bot.loop.create_task(send_test_format())
 
     # Initialization
     async def init():
         d = load_data()
         
-        for c in d["trade_channels"]:
-            try:
-                rem = get_cooldown_remaining(c)
-                st = f"CD: {rem}s" if rem > 0 else "Ready"
-                
-                ch_table.insert_rows([{
-                    "id": c["id"],
-                    "cells": [
-                        {"text": c.get("channel_name", "?"), "imageUrl": c.get("server_icon", ""), "subtext": c.get("server_name", "")},
-                        {"text": f"{c.get('cooldown', 60)}s", "subtext": st},
-                        {"text": st, "subtext": c.get("last_sent", "Never")[:19]},
-                        {}
-                    ]
-                }])
-            except:
-                pass
+        if not getattr(ch_table, "rows", None):
+            for c in d["trade_channels"]:
+                try:
+                    row = build_channel_row(c)
+                    if row:
+                        ch_table.insert_rows([row])
+                except:
+                    pass
         
         if d.get("trade_offers") and d.get("trade_requests"):
             off_in.value = " ".join(d["trade_offers"])
