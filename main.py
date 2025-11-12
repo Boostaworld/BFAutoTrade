@@ -1,7 +1,9 @@
 import json
 import asyncio
+import heapq
 import random
 import re
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 import discord
@@ -245,8 +247,80 @@ def blox_fruits_trader():
     class AutoState:
         running = False
         batch_running = False
-        task = None
         should_stop = False
+
+    class AutoSendManager:
+        def __init__(self, send_coro, max_idle=15):
+            self.heap = []
+            self.index = {}
+            self.send_coro = send_coro
+            self.max_idle = max_idle
+            self.task = None
+            self.running = False
+
+        def start(self):
+            if self.running:
+                return
+            self.running = True
+            self.task = bot.loop.create_task(self._run())
+
+        async def stop(self):
+            self.running = False
+            if self.task:
+                self.task.cancel()
+                try:
+                    await self.task
+                except Exception:
+                    pass
+                self.task = None
+
+        def schedule(self, channel_id, ts):
+            if channel_id is None:
+                return
+            if self.index.get(channel_id) == ts:
+                return
+            self.index[channel_id] = ts
+            heapq.heappush(self.heap, (ts, channel_id))
+
+        def unschedule(self, channel_id):
+            if channel_id is None:
+                return
+            self.index.pop(channel_id, None)
+
+        def reset(self):
+            self.heap.clear()
+            self.index.clear()
+
+        async def _run(self):
+            while self.running:
+                now = time.time()
+                while self.heap and (
+                    self.heap[0][1] not in self.index or self.heap[0][0] != self.index[self.heap[0][1]]
+                ):
+                    heapq.heappop(self.heap)
+
+                if not self.heap:
+                    await asyncio.sleep(self.max_idle)
+                    continue
+
+                ts, ch_id = self.heap[0]
+                delay = ts - now
+
+                if delay > 0:
+                    await asyncio.sleep(min(delay, self.max_idle))
+                    continue
+
+                heapq.heappop(self.heap)
+                if self.index.get(ch_id) != ts:
+                    continue
+
+                self.index.pop(ch_id, None)
+                try:
+                    await self.send_coro(ch_id)
+                except Exception as e:
+                    print(f"✗ send error {ch_id}: {describe_error(e)}", type_="ERROR")
+
+    manager = None
 
     def sanitize_trade_channels(raw_channels):
         if not isinstance(raw_channels, list):
@@ -489,6 +563,31 @@ def blox_fruits_trader():
             return json.dumps(err)
         except TypeError:
             return str(err)
+
+    def schedule_channel(channel):
+        if not channel:
+            return
+        if not manager:
+            return
+
+        cid = channel.get("id") if isinstance(channel, dict) else None
+        if not cid:
+            return
+
+        ts = None
+        cooldown_until = channel.get("cooldown_until") if isinstance(channel.get("cooldown_until"), str) else None
+        if cooldown_until:
+            try:
+                ts = datetime.fromisoformat(cooldown_until).timestamp()
+            except Exception:
+                ts = None
+
+        if ts is None:
+            remaining = get_cooldown_remaining(channel)
+            base = time.time()
+            ts = base if remaining <= 0 else base + remaining
+
+        manager.schedule(cid, ts)
 
     data = load_data()
     emoji_cache = load_emoji_cache()
@@ -790,20 +889,20 @@ def blox_fruits_trader():
             if not has_trade_config(d):
                 print("Configure trade first", type_="WARNING")
                 return
-            
+
             channel = None
             for tc in d["trade_channels"]:
                 if tc["id"] == cid:
                     channel = tc
                     break
-            
+
             if not channel:
                 print("Channel not found", type_="ERROR")
                 return
-            
-            msg = await build_msg(channel["server_id"], d.get("trade_offers_text", ""), d.get("trade_requests_text", ""), channel.get("trade_emoji"))
+
+            msg = await build_msg(channel["server_id"], d["trade_offers"], d["trade_requests"], channel.get("trade_emoji"))
             ok, err = await send_to(channel["id"], msg)
-            
+
             if ok:
                 now = datetime.now()
                 channel["last_sent"] = now.isoformat()
@@ -814,6 +913,8 @@ def blox_fruits_trader():
                 row = build_channel_row(channel)
                 if row:
                     ch_table.update_rows([row])
+
+                schedule_channel(channel)
             else:
                 if isinstance(err, dict) and err.get("type") == "cooldown":
                     try:
@@ -830,6 +931,7 @@ def blox_fruits_trader():
                         if row:
                             ch_table.update_rows([row])
 
+                        schedule_channel(channel)
                         print(f"⌛ {channel['channel_name']}: retry in {int(retry_seconds)}s", type_="WARNING")
                         return
 
@@ -841,9 +943,18 @@ def blox_fruits_trader():
                 save_data(d)
                 print(f"✗ {channel['channel_name']}: {describe_error(err)}", type_="ERROR")
 
+                row = build_channel_row(channel)
+                if row:
+                    ch_table.update_rows([row])
+
+                schedule_channel(channel)
+
         except Exception as e:
             print(f"Send error: {e}", type_="ERROR")
-    
+
+    if manager is None:
+        manager = AutoSendManager(sendNowToChannel)
+
     def removeChannel_sync(row_id):
         removeChannel(row_id)
     
@@ -857,6 +968,9 @@ def blox_fruits_trader():
             if removed <= 0:
                 print(f"Channel {cid} not found", type_="WARNING")
                 return
+
+            if manager:
+                manager.unschedule(cid)
 
             save_data(d)
             ch_table.delete_rows([cid])
@@ -1027,11 +1141,14 @@ def blox_fruits_trader():
                     "trade_emoji": await find_trade_emoji(g),
                     "cooldown_until": None
                 })
-                
+
                 row = build_channel_row(d["trade_channels"][-1])
                 if row:
                     ch_table.insert_rows([row])
-            
+
+                if AutoState.running and manager:
+                    schedule_channel(d["trade_channels"][-1])
+
             save_data(d)
             print(f"Added channels", type_="SUCCESS")
             srv_in.value = ""
@@ -1171,31 +1288,32 @@ def blox_fruits_trader():
         AutoState.should_stop = False
         start_btn.disabled = False
         stop_btn.disabled = True
-    async def auto_loop():
-        print("Auto-send loop startedV3", type_="SUCCESS")
+    async def start_auto_mode():
+        nonlocal manager
 
-        error_log = []
+        if AutoState.running:
+            return
 
-        while AutoState.running:
-            try:
-                d = load_data()
+        d = load_data()
 
                 if not has_trade_config(d) or not d["trade_channels"]:
                     await asyncio.sleep(5)
                     continue
 
-                sent_this_loop = 0
+        if not d["trade_channels"]:
+            print("Add channels first", type_="WARNING")
+            auto_check.checked = False
+            return
 
-                channels_with_cooldowns = []
-                for c in d["trade_channels"]:
-                    rem = get_cooldown_remaining(c)
-                    channels_with_cooldowns.append((rem, c))
+        if manager is None:
+            manager = AutoSendManager(sendNowToChannel)
 
-                channels_with_cooldowns.sort(key=lambda x: x[0])
+        if manager.running:
+            await manager.stop()
 
-                for rem, c in channels_with_cooldowns:
-                    if not AutoState.running:
-                        break
+        manager.reset()
+        for channel in d["trade_channels"]:
+            schedule_channel(channel)
 
                     if rem <= 0:
                         try:
@@ -1244,41 +1362,32 @@ def blox_fruits_trader():
                             print(f"✗ Auto: {c['channel_name']}: {str(e)}", type_="ERROR")
                             error_log.append(f"{c['channel_name']}: {str(e)}")
 
-                save_data(d)
+    async def stop_auto_mode():
+        nonlocal manager
 
-                min_wait = float('inf')
-                for rem, _ in channels_with_cooldowns:
-                    if rem < min_wait:
-                        min_wait = rem
+        if not AutoState.running and (not manager or not manager.running):
+            return
 
-                if sent_this_loop > 0:
-                    wait_time = 1
-                elif min_wait != float('inf') and min_wait > 0:
-                    wait_time = min(min_wait, 10)
-                else:
-                    wait_time = 5
+        AutoState.running = False
 
-                await asyncio.sleep(wait_time)
+        if manager and manager.running:
+            await manager.stop()
 
-            except Exception as e:
-                print(f"Auto-loop error: {str(e)}", type_="ERROR")
-                await asyncio.sleep(10)
+        if manager:
+            manager.reset()
 
-        # Print all errors when stopped
-        if error_log:
-            print(f"\n=== Auto-send Error Summary ({len(error_log)} errors) ===", type_="WARNING")
-            # Group errors by type
-            error_counts = {}
-            for err in error_log:
-                if err not in error_counts:
-                    error_counts[err] = 1
-                else:
-                    error_counts[err] += 1
+        try:
+            d = load_data()
+        except Exception:
+            d = None
 
-            for err, count in error_counts.items():
-                print(f"  [{count}x] {err}", type_="ERROR")
+        has_requirements = bool(
+            d and d.get("trade_channels") and d.get("trade_offers") and d.get("trade_requests")
+        )
+        start_btn.disabled = AutoState.running or not has_requirements
 
-        print("Auto-send loop stopped", type_="INFO")
+        stop_btn.disabled = True
+        print("Auto-send disabled", type_="INFO")
 
     def start_operation():
         d = load_data()
@@ -1286,36 +1395,34 @@ def blox_fruits_trader():
         if not has_trade_config(d):
             print("Configure trade first", type_="WARNING")
             return
-        
+
         if not d["trade_channels"]:
             print("Add channels first", type_="WARNING")
             return
-        
+
         if auto_check.checked:
-            # Start auto-send loop
-            AutoState.running = True
-            start_btn.disabled = True
-            stop_btn.disabled = False
-            AutoState.task = bot.loop.create_task(auto_loop())
+            if AutoState.running:
+                print("Auto-send already running", type_="INFO")
+            else:
+                bot.loop.create_task(start_auto_mode())
         else:
             # Send one batch
             bot.loop.create_task(send_batch())
 
     def stop_operation():
         if auto_check.checked:
-            # Stop auto-send loop
-            if AutoState.running:
-                AutoState.running = False
-                if AutoState.task:
-                    AutoState.task.cancel()
-                start_btn.disabled = False
-                stop_btn.disabled = True
-                print("Auto-send loop stopped", type_="INFO")
+            auto_check.checked = False
         else:
             # Stop batch operation
             if AutoState.batch_running:
                 AutoState.should_stop = True
                 print("Stopping batch send...", type_="WARNING")
+
+    async def handle_auto_toggle(value):
+        if value:
+            await start_auto_mode()
+        else:
+            await stop_auto_mode()
 
     # Event Handlers
     def on_srv_input(v):
@@ -1329,9 +1436,10 @@ def blox_fruits_trader():
     
     def on_req_input(v):
         save_btn.disabled = not (v and off_in.value)
-    
+
     srv_in.onInput = on_srv_input
     ch_in.onInput = on_ch_input
+    auto_check.onChange = lambda v: bot.loop.create_task(handle_auto_toggle(v))
     off_in.onInput = on_off_input
     req_in.onInput = on_req_input
     
