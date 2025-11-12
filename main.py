@@ -712,11 +712,12 @@ def blox_fruits_trader():
 
         if left and right:
             return f"{left} {te} {right}"
-        if left:
-            return f"{left} {te}".strip()
-        if right:
-            return f"{te} {right}".strip()
-        return te
+        elif left:
+            return f"{left} {te}"
+        elif right:
+            return f"{te} {right}"
+        else:
+            return te
 
     async def send_to(cid, msg):
         try:
