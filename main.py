@@ -2,6 +2,7 @@ import json
 import asyncio
 import random
 import re
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 import discord
@@ -17,6 +18,75 @@ def blox_fruits_trader():
     DATA_FILE = BASE_DIR / "blox_trader.json"
     EMOJI_CACHE_FILE = BASE_DIR / "guild_emojis.json"
     BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+    Suppression = {}
+
+    PAUSE_DURATIONS = {
+        "15m": 15 * 60,
+        "1h": 60 * 60,
+        "6h": 6 * 60 * 60,
+    }
+
+    def suppress_guild(gid, until_ts=None):
+        key = str(gid)
+        if until_ts is None:
+            Suppression[key] = "rest"
+        else:
+            Suppression[key] = until_ts
+
+    def unsuppress_guild(gid):
+        Suppression.pop(str(gid), None)
+
+    def is_suppressed(gid):
+        key = str(gid)
+        v = Suppression.get(key)
+        if v is None:
+            return False
+        if v == "rest":
+            return True
+        try:
+            if time.time() < float(v):
+                return True
+        except (TypeError, ValueError):
+            pass
+        Suppression.pop(key, None)
+        return False
+
+    def describe_suppression(gid):
+        key = str(gid)
+        if not is_suppressed(key):
+            return None
+
+        value = Suppression.get(key)
+        if value == "rest":
+            return "Paused (task)"
+
+        try:
+            remaining = float(value) - time.time()
+        except (TypeError, ValueError):
+            return "Paused"
+
+        if remaining == float("inf"):
+            return "Paused (until resume)"
+
+        remaining = int(max(0, remaining))
+        if remaining >= 3600:
+            hours = remaining // 3600
+            minutes = (remaining % 3600) // 60
+            return f"Paused ({hours}h {minutes}m)"
+        if remaining >= 60:
+            minutes = remaining // 60
+            seconds = remaining % 60
+            return f"Paused ({minutes}m {seconds}s)"
+        if remaining > 0:
+            return f"Paused ({remaining}s)"
+        return None
+
+    def clear_task_suppressions():
+        cleared = [gid for gid, state in list(Suppression.items()) if state == "rest"]
+        for gid in cleared:
+            Suppression.pop(gid, None)
+        return cleared
 
     def make_default_data():
         return {
@@ -313,9 +383,13 @@ def blox_fruits_trader():
             cooldown_val = 60
 
         remaining = get_cooldown_remaining(channel)
-        status = f"CD: {remaining}s" if remaining > 0 else "Ready"
+        cooldown_status = f"CD: {remaining}s" if remaining > 0 else "Ready"
         last_sent = channel.get("last_sent") or "Never"
         last_sent = str(last_sent)[:19]
+
+        suppression = describe_suppression(channel.get("server_id"))
+        status_text = suppression or cooldown_status
+        subtext = last_sent if suppression is None else cooldown_status
 
         return {
             "id": cid,
@@ -325,11 +399,130 @@ def blox_fruits_trader():
                     "imageUrl": channel.get("server_icon", ""),
                     "subtext": channel.get("server_name", ""),
                 },
-                {"text": f"{cooldown_val}s", "subtext": status},
-                {"text": status, "subtext": last_sent},
+                {"text": f"{cooldown_val}s", "subtext": cooldown_status},
+                {"text": status_text, "subtext": subtext},
                 {},
             ],
         }
+
+    def refresh_rows_for_server(gid):
+        try:
+            d = load_data()
+        except Exception:
+            return
+
+        rows = []
+        for channel in d.get("trade_channels", []):
+            if str(channel.get("server_id")) == str(gid):
+                row = build_channel_row(channel)
+                if row:
+                    rows.append(row)
+
+        if rows and ch_table:
+            ch_table.update_rows(rows)
+
+    def refresh_all_rows():
+        try:
+            d = load_data()
+        except Exception:
+            return
+
+        rows = []
+        for channel in d.get("trade_channels", []):
+            row = build_channel_row(channel)
+            if row:
+                rows.append(row)
+
+        if rows and ch_table:
+            ch_table.update_rows(rows)
+
+    def pause_server_for_duration(cid, duration_key):
+        channel, data = find_channel_entry(cid)
+        if not channel:
+            print(f"Channel {cid} not found", type_="WARNING")
+            return
+
+        guild_id = channel.get("server_id")
+        if not guild_id:
+            print(f"Server missing for channel {cid}", type_="WARNING")
+            return
+
+        server_name = channel.get("server_name") or guild_id
+
+        if duration_key == "until_resume":
+            suppress_guild(guild_id, float("inf"))
+            label = "until resumed"
+        else:
+            seconds = PAUSE_DURATIONS.get(duration_key)
+            if not seconds:
+                print(f"Unknown pause duration: {duration_key}", type_="ERROR")
+                return
+            suppress_guild(guild_id, time.time() + seconds)
+            if seconds >= 3600:
+                hours = seconds // 3600
+                label = f"for {hours}h"
+            else:
+                minutes = seconds // 60
+                label = f"for {minutes}m"
+
+        refresh_rows_for_server(guild_id)
+        print(f"Paused {server_name} {label}", type_="INFO")
+
+    def resume_server(cid):
+        channel, data = find_channel_entry(cid)
+        if not channel:
+            print(f"Channel {cid} not found", type_="WARNING")
+            return
+
+        guild_id = channel.get("server_id")
+        if not guild_id:
+            print(f"Server missing for channel {cid}", type_="WARNING")
+            return
+
+        server_name = channel.get("server_name") or guild_id
+        if not is_suppressed(guild_id):
+            print(f"Server {server_name} is not paused", type_="INFO")
+            return
+
+        unsuppress_guild(guild_id)
+        refresh_rows_for_server(guild_id)
+        print(f"Resumed server {server_name}", type_="SUCCESS")
+
+    def remove_server_for_task(gid, server_name=None):
+        suppress_guild(gid, None)
+        if server_name:
+            print(f"Removed server {server_name} ({gid}) for the rest of this task", type_="INFO")
+        else:
+            print(f"Removed server {gid} for the rest of this task", type_="INFO")
+
+    def removeServer_sync(guild_id, server_name=None):
+        remove_server_for_task(guild_id, server_name)
+
+    def remove_server_action(cid):
+        channel, data = find_channel_entry(cid)
+        if not channel:
+            print(f"Channel {cid} not found", type_="WARNING")
+            return
+
+        guild_id = channel.get("server_id")
+        if not guild_id:
+            print(f"Server missing for channel {cid}", type_="WARNING")
+            return
+
+        removeServer_sync(guild_id, channel.get("server_name"))
+        refresh_rows_for_server(guild_id)
+
+    def pause_server_15m(cid):
+        pause_server_for_duration(cid, "15m")
+
+    def pause_server_1h(cid):
+        pause_server_for_duration(cid, "1h")
+
+    def pause_server_6h(cid):
+        pause_server_for_duration(cid, "6h")
+
+    def pause_server_until_resume(cid):
+        pause_server_for_duration(cid, "until_resume")
 
     def describe_error(err):
         if isinstance(err, str):
@@ -338,6 +531,16 @@ def blox_fruits_trader():
             return json.dumps(err)
         except TypeError:
             return str(err)
+
+    def find_channel_entry(cid, data=None):
+        if data is None:
+            data = load_data()
+
+        for channel in data.get("trade_channels", []):
+            if str(channel.get("id")) == str(cid):
+                return channel, data
+
+        return None, data
 
     data = load_data()
     emoji_cache = load_emoji_cache()
@@ -617,24 +820,35 @@ def blox_fruits_trader():
     async def sendNowToChannel(cid):
         try:
             d = load_data()
-            
+
             if not d["trade_offers"] or not d["trade_requests"]:
                 print("Configure trade first", type_="WARNING")
                 return
-            
+
             channel = None
             for tc in d["trade_channels"]:
                 if tc["id"] == cid:
                     channel = tc
                     break
-            
+
             if not channel:
                 print("Channel not found", type_="ERROR")
                 return
-            
+
+            discord_channel = bot.get_channel(int(channel["id"]))
+            guild_obj = getattr(discord_channel, "guild", None) if discord_channel else None
+            guild_id = str(guild_obj.id) if guild_obj else str(channel.get("server_id") or "")
+
+            if guild_id:
+                label = describe_suppression(guild_id)
+                if label:
+                    print(f"⏸️ {channel['channel_name']}: {label}", type_="WARNING")
+                    refresh_rows_for_server(guild_id)
+                    return
+
             msg = await build_msg(channel["server_id"], d["trade_offers"], d["trade_requests"], channel.get("trade_emoji"))
             ok, err = await send_to(channel["id"], msg)
-            
+
             if ok:
                 now = datetime.now()
                 channel["last_sent"] = now.isoformat()
@@ -709,7 +923,13 @@ def blox_fruits_trader():
             {"type": "text", "label": "Status"},
             {"type": "button", "label": "Actions", "buttons": [
                 {"label": "Send Now", "color": "default", "onClick": sendNowToChannel_sync},
-                {"label": "Remove", "color": "danger", "onClick": removeChannel_sync}
+                {"label": "Pause 15m", "color": "warning", "onClick": pause_server_15m},
+                {"label": "Pause 1h", "color": "warning", "onClick": pause_server_1h},
+                {"label": "Pause 6h", "color": "warning", "onClick": pause_server_6h},
+                {"label": "Pause (Until Resume)", "color": "warning", "onClick": pause_server_until_resume},
+                {"label": "Resume Server", "color": "success", "onClick": resume_server},
+                {"label": "Remove Server (Task)", "color": "danger", "onClick": remove_server_action},
+                {"label": "Remove Channel", "color": "danger", "onClick": removeChannel_sync}
             ]}
         ], rows=initial_channel_rows
     )
@@ -903,14 +1123,22 @@ def blox_fruits_trader():
             if AutoState.should_stop:
                 print(f"⏸ Batch stopped at channel {idx}/{total}: {c['channel_name']}", type_="WARNING")
                 break
-                
+
             try:
+                guild_id = c.get("server_id")
+                if guild_id:
+                    label = describe_suppression(guild_id)
+                    if label:
+                        skip += 1
+                        print(f"[{idx}/{total}] ⏸️ {c['channel_name']}: {label}", type_="WARNING")
+                        continue
+
                 rem = get_cooldown_remaining(c)
                 if rem > 0:
                     skip += 1
                     print(f"[{idx}/{total}] Skipped {c['channel_name']} (cooldown: {rem}s)", type_="INFO")
                     continue
-                
+
                 msg = await build_msg(c["server_id"], d["trade_offers"], d["trade_requests"], c.get("trade_emoji"))
                 ok, err = await send_to(c["id"], msg)
                 
@@ -953,7 +1181,11 @@ def blox_fruits_trader():
             print(f"Batch stopped: {sent} sent, {skip} skipped, {fail} failed", type_="WARNING")
         else:
             print(f"Batch complete: {sent} sent, {skip} skipped, {fail} failed", type_="SUCCESS")
-        
+
+        cleared = clear_task_suppressions()
+        if cleared:
+            refresh_all_rows()
+
         AutoState.batch_running = False
         AutoState.should_stop = False
         start_btn.disabled = False
@@ -963,109 +1195,121 @@ def blox_fruits_trader():
 
         error_log = []
 
-        while AutoState.running:
-            try:
-                d = load_data()
+        try:
+            while AutoState.running:
+                try:
+                    d = load_data()
 
-                if not d["trade_offers"] or not d["trade_requests"] or not d["trade_channels"]:
-                    await asyncio.sleep(5)
-                    continue
+                    if not d["trade_offers"] or not d["trade_requests"] or not d["trade_channels"]:
+                        await asyncio.sleep(5)
+                        continue
 
-                sent_this_loop = 0
+                    sent_this_loop = 0
 
-                channels_with_cooldowns = []
-                for c in d["trade_channels"]:
-                    rem = get_cooldown_remaining(c)
-                    channels_with_cooldowns.append((rem, c))
+                    channels_with_cooldowns = []
+                    for c in d["trade_channels"]:
+                        rem = get_cooldown_remaining(c)
+                        channels_with_cooldowns.append((rem, c))
 
-                channels_with_cooldowns.sort(key=lambda x: x[0])
+                    channels_with_cooldowns.sort(key=lambda x: x[0])
 
-                for rem, c in channels_with_cooldowns:
-                    if not AutoState.running:
-                        break
+                    for rem, c in channels_with_cooldowns:
+                        if not AutoState.running:
+                            break
 
-                    if rem <= 0:
-                        try:
-                            msg = await build_msg(c["server_id"], d["trade_offers"], d["trade_requests"], c.get("trade_emoji"))
-                            ok, err = await send_to(c["id"], msg)
+                        guild_id = c.get("server_id")
+                        if guild_id:
+                            label = describe_suppression(guild_id)
+                            if label:
+                                print(f"⏸️ Auto: {c['channel_name']}: {label}", type_="INFO")
+                                continue
 
-                            if ok:
-                                now = datetime.now()
-                                c["last_sent"] = now.isoformat()
-                                c["cooldown_until"] = None
-                                sent_this_loop += 1
-                                print(f"✓ Auto: {c['channel_name']}", type_="SUCCESS")
-                            else:
-                                message = describe_error(err)
-                                if isinstance(err, dict) and err.get("type") == "cooldown":
-                                    try:
-                                        retry_seconds = float(err.get("retry_after", 0))
-                                    except (TypeError, ValueError):
-                                        retry_seconds = 0
-
-                                    if retry_seconds > 0:
-                                        next_time = datetime.now() + timedelta(seconds=retry_seconds)
-                                        c["cooldown_until"] = next_time.isoformat()
-                                        print(f"⌛ Auto: {c['channel_name']} retry in {int(retry_seconds)}s", type_="WARNING")
-                                    else:
-                                        print(f"✗ Auto: {c['channel_name']}: {message}", type_="ERROR")
-                                else:
-                                    try:
-                                        cooldown_val = int(c.get("cooldown", 60))
-                                    except:
-                                        cooldown_val = 60
-                                    next_time = datetime.now() + timedelta(seconds=cooldown_val)
-                                    c["cooldown_until"] = next_time.isoformat()
-                                    print(f"✗ Auto: {c['channel_name']}: {message}", type_="ERROR")
-
-                                error_log.append(f"{c['channel_name']}: {message}")
-
-                            await asyncio.sleep(random.uniform(2, 4))
-                        except Exception as e:
+                        if rem <= 0:
                             try:
-                                cooldown_val = int(c.get("cooldown", 60))
-                            except:
-                                cooldown_val = 60
-                            next_time = datetime.now() + timedelta(seconds=cooldown_val)
-                            c["cooldown_until"] = next_time.isoformat()
-                            print(f"✗ Auto: {c['channel_name']}: {str(e)}", type_="ERROR")
-                            error_log.append(f"{c['channel_name']}: {str(e)}")
+                                msg = await build_msg(c["server_id"], d["trade_offers"], d["trade_requests"], c.get("trade_emoji"))
+                                ok, err = await send_to(c["id"], msg)
 
-                save_data(d)
+                                if ok:
+                                    now = datetime.now()
+                                    c["last_sent"] = now.isoformat()
+                                    c["cooldown_until"] = None
+                                    sent_this_loop += 1
+                                    print(f"✓ Auto: {c['channel_name']}", type_="SUCCESS")
+                                else:
+                                    message = describe_error(err)
+                                    if isinstance(err, dict) and err.get("type") == "cooldown":
+                                        try:
+                                            retry_seconds = float(err.get("retry_after", 0))
+                                        except (TypeError, ValueError):
+                                            retry_seconds = 0
 
-                min_wait = float('inf')
-                for rem, _ in channels_with_cooldowns:
-                    if rem < min_wait:
-                        min_wait = rem
+                                        if retry_seconds > 0:
+                                            next_time = datetime.now() + timedelta(seconds=retry_seconds)
+                                            c["cooldown_until"] = next_time.isoformat()
+                                            print(f"⌛ Auto: {c['channel_name']} retry in {int(retry_seconds)}s", type_="WARNING")
+                                        else:
+                                            print(f"✗ Auto: {c['channel_name']}: {message}", type_="ERROR")
+                                    else:
+                                        try:
+                                            cooldown_val = int(c.get("cooldown", 60))
+                                        except:
+                                            cooldown_val = 60
+                                        next_time = datetime.now() + timedelta(seconds=cooldown_val)
+                                        c["cooldown_until"] = next_time.isoformat()
+                                        print(f"✗ Auto: {c['channel_name']}: {message}", type_="ERROR")
 
-                if sent_this_loop > 0:
-                    wait_time = 1
-                elif min_wait != float('inf') and min_wait > 0:
-                    wait_time = min(min_wait, 10)
-                else:
-                    wait_time = 5
+                                    error_log.append(f"{c['channel_name']}: {message}")
 
-                await asyncio.sleep(wait_time)
+                                await asyncio.sleep(random.uniform(2, 4))
+                            except Exception as e:
+                                try:
+                                    cooldown_val = int(c.get("cooldown", 60))
+                                except:
+                                    cooldown_val = 60
+                                next_time = datetime.now() + timedelta(seconds=cooldown_val)
+                                c["cooldown_until"] = next_time.isoformat()
+                                print(f"✗ Auto: {c['channel_name']}: {str(e)}", type_="ERROR")
+                                error_log.append(f"{c['channel_name']}: {str(e)}")
 
-            except Exception as e:
-                print(f"Auto-loop error: {str(e)}", type_="ERROR")
-                await asyncio.sleep(10)
+                    save_data(d)
 
-        # Print all errors when stopped
-        if error_log:
-            print(f"\n=== Auto-send Error Summary ({len(error_log)} errors) ===", type_="WARNING")
-            # Group errors by type
-            error_counts = {}
-            for err in error_log:
-                if err not in error_counts:
-                    error_counts[err] = 1
-                else:
-                    error_counts[err] += 1
+                    min_wait = float('inf')
+                    for rem, _ in channels_with_cooldowns:
+                        if rem < min_wait:
+                            min_wait = rem
 
-            for err, count in error_counts.items():
-                print(f"  [{count}x] {err}", type_="ERROR")
+                    if sent_this_loop > 0:
+                        wait_time = 1
+                    elif min_wait != float('inf') and min_wait > 0:
+                        wait_time = min(min_wait, 10)
+                    else:
+                        wait_time = 5
 
-        print("Auto-send loop stopped", type_="INFO")
+                    await asyncio.sleep(wait_time)
+
+                except Exception as e:
+                    print(f"Auto-loop error: {str(e)}", type_="ERROR")
+                    await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if error_log:
+                print(f"\n=== Auto-send Error Summary ({len(error_log)} errors) ===", type_="WARNING")
+                error_counts = {}
+                for err in error_log:
+                    if err not in error_counts:
+                        error_counts[err] = 1
+                    else:
+                        error_counts[err] += 1
+
+                for err, count in error_counts.items():
+                    print(f"  [{count}x] {err}", type_="ERROR")
+
+            cleared = clear_task_suppressions()
+            if cleared:
+                refresh_all_rows()
+
+            print("Auto-send loop stopped", type_="INFO")
 
     def start_operation():
         d = load_data()
@@ -1097,7 +1341,10 @@ def blox_fruits_trader():
                     AutoState.task.cancel()
                 start_btn.disabled = False
                 stop_btn.disabled = True
-                print("Auto-send loop stopped", type_="INFO")
+                print("Stopping auto-send loop...", type_="WARNING")
+                cleared = clear_task_suppressions()
+                if cleared:
+                    refresh_all_rows()
         else:
             # Stop batch operation
             if AutoState.batch_running:
