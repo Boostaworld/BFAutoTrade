@@ -2,7 +2,6 @@ import json
 import asyncio
 import random
 import re
-from copy import deepcopy
 from pathlib import Path
 from datetime import datetime, timedelta
 import discord
@@ -19,11 +18,12 @@ def blox_fruits_trader():
     EMOJI_CACHE_FILE = BASE_DIR / "guild_emojis.json"
     BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-    DEFAULT_DATA = {
-        "trade_channels": [],
-        "trade_offers": [],
-        "trade_requests": []
-    }
+    def make_default_data():
+        return {
+            "trade_channels": [],
+            "trade_offers": [],
+            "trade_requests": []
+        }
 
     FRUIT_ALIASES = {
         "leopard": ["tiger"], "rumble": ["lightning"], "spirit": ["soul"],
@@ -165,7 +165,7 @@ def blox_fruits_trader():
             raw = {}
             load_failed = True
 
-        data = deepcopy(DEFAULT_DATA)
+        data = make_default_data()
         changed = load_failed
 
         sanitized_channels, channels_changed = sanitize_trade_channels(raw.get("trade_channels"))
