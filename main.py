@@ -1,8 +1,10 @@
 import json
 import os
 import asyncio
+import heapq
 import random
 import re
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 import discord
@@ -19,19 +21,222 @@ def blox_fruits_trader():
     EMOJI_CACHE_FILE = BASE_DIR / "guild_emojis.json"
     BASE_DIR.mkdir(parents=True, exist_ok=True)
 
+    Suppression = {}
+
+    PAUSE_DURATIONS = {
+        "15m": 15 * 60,
+        "1h": 60 * 60,
+        "6h": 6 * 60 * 60,
+    }
+
+    def suppress_guild(gid, until_ts=None):
+        key = str(gid)
+        if until_ts is None:
+            Suppression[key] = "rest"
+        else:
+            Suppression[key] = until_ts
+
+    def unsuppress_guild(gid):
+        Suppression.pop(str(gid), None)
+
+    def is_suppressed(gid):
+        key = str(gid)
+        v = Suppression.get(key)
+        if v is None:
+            return False
+        if v == "rest":
+            return True
+        try:
+            if time.time() < float(v):
+                return True
+        except (TypeError, ValueError):
+            pass
+        Suppression.pop(key, None)
+        return False
+
+    def describe_suppression(gid):
+        key = str(gid)
+        if not is_suppressed(gid):
+            return None
+
+        value = Suppression.get(key)
+        if value == "rest":
+            return "Paused (task)"
+
+        try:
+            remaining = float(value) - time.time()
+        except (TypeError, ValueError):
+            return "Paused"
+
+        if remaining == float("inf"):
+            return "Paused (until resume)"
+
+        remaining = int(max(0, remaining))
+        if remaining >= 3600:
+            hours = remaining // 3600
+            minutes = (remaining % 3600) // 60
+            return f"Paused ({hours}h {minutes}m)"
+        if remaining >= 60:
+            minutes = remaining // 60
+            seconds = remaining % 60
+            return f"Paused ({minutes}m {seconds}s)"
+        if remaining > 0:
+            return f"Paused ({remaining}s)"
+        return None
+
+    def clear_task_suppressions():
+        cleared = [gid for gid, state in list(Suppression.items()) if state == "rest"]
+        for gid in cleared:
+            Suppression.pop(gid, None)
+        return cleared
+
     def make_default_data():
         return {
             "trade_channels": [],
             "trade_offers": [],
-            "trade_requests": []
+            "trade_requests": [],
+            "trade_offers_text": "",
+            "trade_requests_text": ""
         }
 
     FRUIT_ALIASES = {
         "leopard": ["tiger"], "rumble": ["lightning"], "spirit": ["soul"],
         "t-rex": ["trex", "rex"], "control": ["kage"], "dough": ["doughnut"],
         "buddha": ["budha"], "phoenix": ["phenix", "pheonix"],
-        "storage": ["capacity"], "storages": ["capacity"],
+        "storage": ["capacity", "storages"],
+        "gas": ["gases"],
     }
+
+    def _norm_name(s: str) -> str:
+        return re.sub(r"[^a-z0-9_]+", "_", s.strip().lower())
+
+    def build_emoji_cache():
+        cache = {}
+        bot_obj = globals().get("bot")
+        if not bot_obj:
+            return cache
+
+        for g in getattr(bot_obj, "guilds", []):
+            for e in getattr(g, "emojis", []):
+                cache[_norm_name(e.name)] = e
+
+        return cache
+
+    EMOJI_CACHE = build_emoji_cache()
+
+    def resolve_emoji(name_norm):
+        if not name_norm:
+            return None
+
+        if name_norm in EMOJI_CACHE:
+            return EMOJI_CACHE[name_norm]
+
+        for k, e in EMOJI_CACHE.items():
+            if k.startswith(name_norm):
+                EMOJI_CACHE[name_norm] = e
+                return e
+
+        for k, e in EMOJI_CACHE.items():
+            if name_norm in k:
+                EMOJI_CACHE[name_norm] = e
+                return e
+
+        return None
+
+    NAME_CANONICAL_MAP = {}
+    NORMALIZED_ALIASES = {}
+    for canonical, alias_list in FRUIT_ALIASES.items():
+        canonical_norm = _norm_name(canonical)
+        NAME_CANONICAL_MAP[canonical_norm] = canonical_norm
+        normalized_aliases = []
+        for alias in alias_list:
+            alias_norm = _norm_name(alias)
+            NAME_CANONICAL_MAP[alias_norm] = canonical_norm
+            normalized_aliases.append(alias_norm)
+        if normalized_aliases:
+            NORMALIZED_ALIASES[canonical_norm] = normalized_aliases
+
+    def _split_chunks(text):
+        if not text:
+            return []
+
+        prepared = re.sub(r"[\n;]+", ",", text)
+        prepared = prepared.replace("~", ", or,")
+        return [c.strip() for c in prepared.split(",") if c.strip()]
+
+    _COUNT_RX = re.compile(r"(?i)^(?:(\d+)\s+)?([a-z][a-z0-9_ \-]+?)(?:\s*x\s*(\d+))?$")
+
+    def parse_items(s: str):
+        items = []
+        for chunk in _split_chunks(s):
+            m = _COUNT_RX.match(chunk)
+            if not m:
+                continue
+            c1, name, c3 = m.groups()
+            base_name = name.strip()
+            if " " in base_name:
+                parts = base_name.split()
+                parts[-1] = singularize_token(parts[-1])
+                base_name = " ".join(parts)
+            else:
+                base_name = singularize_token(base_name)
+            count = int(c1 or c3 or 1)
+            items.append((_norm_name(base_name), count))
+        return items
+
+    def fallback_text_tokens(raw):
+        if not raw:
+            return []
+        tokens = []
+        for chunk in _split_chunks(raw):
+            if LITERAL_EMOJI_PATTERN.match(chunk):
+                tokens.append(chunk)
+            else:
+                tokens.append(f"`{chunk}`")
+        return tokens
+
+    def tokens_from_items(s: str):
+        parts = []
+        if not s:
+            return parts
+
+        for chunk in _split_chunks(s):
+            if LITERAL_EMOJI_PATTERN.match(chunk):
+                parts.append(chunk)
+                continue
+
+            parsed = parse_items(chunk)
+            if not parsed:
+                parts.append(f"`{chunk}`")
+                continue
+
+            for name_norm, count in parsed:
+                canonical = NAME_CANONICAL_MAP.get(name_norm, name_norm)
+                all_candidates = [canonical, name_norm] + NORMALIZED_ALIASES.get(canonical, [])
+                search_candidates = list(dict.fromkeys(c for c in all_candidates if c))
+
+                em = None
+                for candidate in search_candidates:
+                    em = resolve_emoji(candidate)
+                    if em:
+                        EMOJI_CACHE.setdefault(name_norm, em)
+                        break
+
+                if not em and canonical == "or":
+                    parts.extend(["🔁"] * count)
+                    continue
+
+                if em:
+                    tok = f"<a:{em.name}:{em.id}>" if getattr(em, "animated", False) else f"<:{em.name}:{em.id}>"
+                    parts.extend([tok] * count)
+                else:
+                    readable = canonical.replace("_", " ")
+                    if count > 1:
+                        readable = f"{readable} x{count}"
+                    print(f"⚠ unknown emoji: {chunk}", type_="WARNING")
+                    parts.append(f"`{readable}`")
+
+        return parts
 
     TOKEN_PATTERN = re.compile(r'<a?:[^:]+:\d+>|:[^:\s]+:|[^,\s]+')
     LITERAL_EMOJI_PATTERN = re.compile(r'^<a?:[^:]+:\d+>$')
@@ -70,36 +275,30 @@ def blox_fruits_trader():
         if not raw:
             return []
 
-        tokens = TOKEN_PATTERN.findall(raw)
-        if not tokens:
-            return []
+        display = []
+        for chunk in _split_chunks(raw):
+            if LITERAL_EMOJI_PATTERN.match(chunk):
+                display.append(chunk)
+                continue
 
-        expanded = []
-        i = 0
-        while i < len(tokens):
-            token = tokens[i]
+            parsed = parse_items(chunk)
+            if not parsed:
+                display.append(chunk)
+                continue
 
-            if token.isdigit() and i + 1 < len(tokens):
-                try:
-                    count = int(token)
-                except ValueError:
-                    count = 0
+            for name_norm, count in parsed:
+                canonical = NAME_CANONICAL_MAP.get(name_norm, name_norm)
+                label = canonical.replace("_", " ")
+                if count > 1:
+                    label = f"{label} x{count}"
+                display.append(label)
 
-                if count > 0:
-                    next_token = tokens[i + 1]
-                    if next_token not in SEPARATOR_TOKENS:
-                        base_token = singularize_token(next_token)
-                        if base_token and base_token not in SEPARATOR_TOKENS and not base_token.isdigit():
-                            expanded.extend([base_token] * count)
-                            i += 2
-                            continue
-
-            expanded.append(token)
-            i += 1
-
-        return expanded
+        return display
 
     def normalize_trade_entries(values):
+        if isinstance(values, str):
+            return parse_trade_input(values)
+
         if not isinstance(values, list):
             return []
 
@@ -118,7 +317,6 @@ def blox_fruits_trader():
     class AutoState:
         running = False
         batch_running = False
-        task = None
         should_stop = False
         manager = None
         server_paused = True
@@ -186,6 +384,75 @@ def blox_fruits_trader():
         manager = AutoState.manager
         if manager and manager.running:
             bot.loop.create_task(manager.stop())
+
+    class ChannelScheduleManager:
+        def __init__(self):
+            self._schedule = {}
+
+        def schedule(self, channel_id, timestamp):
+            try:
+                self._schedule[str(channel_id)] = float(timestamp)
+            except (TypeError, ValueError) as e:
+                print(f"Could not schedule channel {channel_id} with timestamp {timestamp}: {e}", type_="WARNING")
+
+        def get(self, channel_id, default=None):
+            return self._schedule.get(str(channel_id), default)
+
+    manager = ChannelScheduleManager()
+
+    def to_timestamp(value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value).timestamp()
+        except ValueError:
+            return None
+
+    def channel_cooldown_seconds(ch):
+        try:
+            sd = getattr(ch, "slowmode_delay", None)
+            return int(sd) if sd is not None else 60
+        except (ValueError, TypeError):
+            return 60
+
+    def compute_next_ts(ch, last_sent_ts=None):
+        base = time.time() if last_sent_ts is None else last_sent_ts
+        return base + channel_cooldown_seconds(ch)
+
+    def get_last_sent_ts(channel_id, record=None):
+        entry = record
+        if entry is None:
+            data = load_data()
+            target = str(channel_id)
+            entry = next((tc for tc in data.get("trade_channels", []) if str(tc.get("id")) == target), None)
+        if not entry:
+            return None
+        return to_timestamp(entry.get("last_sent"))
+
+    def get_cooldown_until_ts(record):
+        if not record:
+            return None
+        return to_timestamp(record.get("cooldown_until"))
+
+    def schedule_channel(ch, record):
+        if not ch or not record:
+            return
+
+        cid = record.get("id") or getattr(ch, "id", None)
+        if not cid:
+            return
+
+        last_sent_ts = get_last_sent_ts(cid, record)
+        if last_sent_ts is None:
+            last_sent_ts = time.time() - channel_cooldown_seconds(ch)
+
+        next_ts = compute_next_ts(ch, last_sent_ts)
+
+        cooldown_until_ts = get_cooldown_until_ts(record)
+        if cooldown_until_ts is not None:
+            next_ts = max(next_ts, cooldown_until_ts)
+
+        manager.schedule(cid, next_ts)
 
     def sanitize_trade_channels(raw_channels):
         if not isinstance(raw_channels, list):
@@ -306,6 +573,26 @@ def blox_fruits_trader():
         data["trade_offers"] = normalized_offers
         data["trade_requests"] = normalized_requests
 
+        offers_text_raw = raw.get("trade_offers_text")
+        if isinstance(offers_text_raw, str):
+            offers_text = offers_text_raw.strip()
+        else:
+            offers_text = ", ".join(normalized_offers)
+
+        requests_text_raw = raw.get("trade_requests_text")
+        if isinstance(requests_text_raw, str):
+            requests_text = requests_text_raw.strip()
+        else:
+            requests_text = ", ".join(normalized_requests)
+
+        if offers_text != offers_text_raw:
+            changed = True
+        if requests_text != requests_text_raw:
+            changed = True
+
+        data["trade_offers_text"] = offers_text
+        data["trade_requests_text"] = requests_text
+
         for tc in data.get("trade_channels", []):
             if "cooldown_until" not in tc:
                 tc["cooldown_until"] = None
@@ -325,6 +612,9 @@ def blox_fruits_trader():
             os.replace(tmp, DATA_FILE)
         except Exception as e:
             print(f"✗ Failed to save data: {describe_error(e)}", type_="ERROR")
+
+    def has_trade_config(data):
+        return bool(data.get("trade_offers_text") and data.get("trade_requests_text"))
 
     def load_emoji_cache():
         try:
@@ -382,9 +672,13 @@ def blox_fruits_trader():
             cooldown_val = 60
 
         remaining = get_cooldown_remaining(channel)
-        status = f"CD: {remaining}s" if remaining > 0 else "Ready"
+        cooldown_status = f"CD: {remaining}s" if remaining > 0 else "Ready"
         last_sent = channel.get("last_sent") or "Never"
         last_sent = str(last_sent)[:19]
+
+        suppression = describe_suppression(channel.get("server_id"))
+        status_text = suppression or cooldown_status
+        subtext = last_sent if suppression is None else cooldown_status
 
         return {
             "id": cid,
@@ -394,11 +688,130 @@ def blox_fruits_trader():
                     "imageUrl": channel.get("server_icon", ""),
                     "subtext": channel.get("server_name", ""),
                 },
-                {"text": f"{cooldown_val}s", "subtext": status},
-                {"text": status, "subtext": last_sent},
+                {"text": f"{cooldown_val}s", "subtext": cooldown_status},
+                {"text": status_text, "subtext": subtext},
                 {},
             ],
         }
+
+    def refresh_rows_for_server(gid):
+        try:
+            d = load_data()
+        except Exception:
+            return
+
+        rows = []
+        for channel in d.get("trade_channels", []):
+            if str(channel.get("server_id")) == str(gid):
+                row = build_channel_row(channel)
+                if row:
+                    rows.append(row)
+
+        if rows and ch_table:
+            ch_table.update_rows(rows)
+
+    def refresh_all_rows():
+        try:
+            d = load_data()
+        except Exception:
+            return
+
+        rows = []
+        for channel in d.get("trade_channels", []):
+            row = build_channel_row(channel)
+            if row:
+                rows.append(row)
+
+        if rows and ch_table:
+            ch_table.update_rows(rows)
+
+    def pause_server_for_duration(cid, duration_key):
+        channel, data = find_channel_entry(cid)
+        if not channel:
+            print(f"Channel {cid} not found", type_="WARNING")
+            return
+
+        guild_id = channel.get("server_id")
+        if not guild_id:
+            print(f"Server missing for channel {cid}", type_="WARNING")
+            return
+
+        server_name = channel.get("server_name") or guild_id
+
+        if duration_key == "until_resume":
+            suppress_guild(guild_id, float("inf"))
+            label = "until resumed"
+        else:
+            seconds = PAUSE_DURATIONS.get(duration_key)
+            if not seconds:
+                print(f"Unknown pause duration: {duration_key}", type_="ERROR")
+                return
+            suppress_guild(guild_id, time.time() + seconds)
+            if seconds >= 3600:
+                hours = seconds // 3600
+                label = f"for {hours}h"
+            else:
+                minutes = seconds // 60
+                label = f"for {minutes}m"
+
+        refresh_rows_for_server(guild_id)
+        print(f"Paused {server_name} {label}", type_="INFO")
+
+    def resume_server(cid):
+        channel, data = find_channel_entry(cid)
+        if not channel:
+            print(f"Channel {cid} not found", type_="WARNING")
+            return
+
+        guild_id = channel.get("server_id")
+        if not guild_id:
+            print(f"Server missing for channel {cid}", type_="WARNING")
+            return
+
+        server_name = channel.get("server_name") or guild_id
+        if not is_suppressed(guild_id):
+            print(f"Server {server_name} is not paused", type_="INFO")
+            return
+
+        unsuppress_guild(guild_id)
+        refresh_rows_for_server(guild_id)
+        print(f"Resumed server {server_name}", type_="SUCCESS")
+
+    def remove_server_for_task(gid, server_name=None):
+        suppress_guild(gid, None)
+        if server_name:
+            print(f"Removed server {server_name} ({gid}) for the rest of this task", type_="INFO")
+        else:
+            print(f"Removed server {gid} for the rest of this task", type_="INFO")
+
+    def removeServer_sync(guild_id, server_name=None):
+        remove_server_for_task(guild_id, server_name)
+
+    def remove_server_action(cid):
+        channel, data = find_channel_entry(cid)
+        if not channel:
+            print(f"Channel {cid} not found", type_="WARNING")
+            return
+
+        guild_id = channel.get("server_id")
+        if not guild_id:
+            print(f"Server missing for channel {cid}", type_="WARNING")
+            return
+
+        removeServer_sync(guild_id, channel.get("server_name"))
+        refresh_rows_for_server(guild_id)
+
+    def pause_server_15m(cid):
+        pause_server_for_duration(cid, "15m")
+
+    def pause_server_1h(cid):
+        pause_server_for_duration(cid, "1h")
+
+    def pause_server_6h(cid):
+        pause_server_for_duration(cid, "6h")
+
+    def pause_server_until_resume(cid):
+        pause_server_for_duration(cid, "until_resume")
 
     def describe_error(err):
         if isinstance(err, str):
@@ -407,6 +820,16 @@ def blox_fruits_trader():
             return json.dumps(err)
         except TypeError:
             return str(err)
+
+    def find_channel_entry(cid, data=None):
+        if data is None:
+            data = load_data()
+
+        for channel in data.get("trade_channels", []):
+            if str(channel.get("id")) == str(cid):
+                return channel, data
+
+        return None, data
 
     data = load_data()
     emoji_cache = load_emoji_cache()
@@ -603,30 +1026,39 @@ def blox_fruits_trader():
         except:
             return None
 
-    async def build_msg(gid, offers, requests, te=None):
+    async def build_msg(gid, offers_text, requests_text, te=None):
+        offers_text = offers_text or ""
+        requests_text = requests_text or ""
+
         g = bot.get_guild(int(gid))
+        if g:
+            for e in getattr(g, "emojis", []):
+                key = _norm_name(e.name)
+                if key not in EMOJI_CACHE:
+                    EMOJI_CACHE[key] = e
+
         if not te:
             te = await find_trade_emoji(g) if g else "↔️"
 
-        oe = []
-        for o in offers:
-            if o in SEPARATOR_TOKENS:
-                oe.append(o)
-                continue
+        left_tokens = tokens_from_items(offers_text)
+        right_tokens = tokens_from_items(requests_text)
 
-            e = await fetch_emoji(gid, o.strip())
-            oe.append(e if e else f"`{o.strip()}`")
+        if not left_tokens:
+            left_tokens = fallback_text_tokens(offers_text)
+        if not right_tokens:
+            right_tokens = fallback_text_tokens(requests_text)
 
-        re = []
-        for r in requests:
-            if r in SEPARATOR_TOKENS:
-                re.append(r)
-                continue
+        left = " ".join(left_tokens).strip()
+        right = " ".join(right_tokens).strip()
 
-            e = await fetch_emoji(gid, r.strip())
-            re.append(e if e else f"`{r.strip()}`")
-
-        return f"{' '.join(oe)} {te} {' '.join(re)}"
+        if left and right:
+            return f"{left} {te} {right}"
+        elif left:
+            return f"{left} {te}"
+        elif right:
+            return f"{te} {right}"
+        else:
+            return te
 
     async def send_to(cid, msg):
         try:
@@ -660,7 +1092,7 @@ def blox_fruits_trader():
         print("Sending test format...", type_="INFO")
         try:
             d = load_data()
-            if not d["trade_offers"] or not d["trade_requests"]:
+            if not has_trade_config(d):
                 print("Configure trade first", type_="WARNING")
                 return
 
@@ -671,7 +1103,7 @@ def blox_fruits_trader():
             if not server_id:
                 server_id = "0"
 
-            msg = await build_msg(server_id, d["trade_offers"], d["trade_requests"])
+            msg = await build_msg(server_id, d.get("trade_offers_text", ""), d.get("trade_requests_text", ""))
             ok, err = await send_to("1390328683494903978", msg)
 
             if ok:
@@ -684,28 +1116,44 @@ def blox_fruits_trader():
             test_btn.loading = False
             test_btn.disabled = False
 
-    # Main Functions
+    # Button/Row Action Wrappers
+    def handle_detect():
+        bot.loop.create_task(detect())
+
+    def handle_test():
+        bot.loop.create_task(send_test_format())
+
+    def handle_add():
+        bot.loop.create_task(add())
+
     def sendNowToChannel_sync(row_id):
         bot.loop.create_task(sendNowToChannel(row_id))
     
     async def sendNowToChannel(cid):
         try:
             d = load_data()
-            
+
             if not d["trade_offers"] or not d["trade_requests"]:
                 print("Configure trade first", type_="WARNING")
                 return
-            
-            channel = None
-            for tc in d["trade_channels"]:
-                if tc["id"] == cid:
-                    channel = tc
-                    break
-            
+
+            channel, _ = find_channel_entry(cid, d)
+
             if not channel:
                 print("Channel not found", type_="ERROR")
                 return
-            
+
+            discord_channel = bot.get_channel(int(channel["id"]))
+            guild_obj = getattr(discord_channel, "guild", None) if discord_channel else None
+            guild_id = str(guild_obj.id) if guild_obj else str(channel.get("server_id") or "")
+
+            if guild_id:
+                label = describe_suppression(guild_id)
+                if label:
+                    print(f"⏸️ {channel['channel_name']}: {label}", type_="WARNING")
+                    refresh_rows_for_server(guild_id)
+                    return
+
             msg = await build_msg(channel["server_id"], d["trade_offers"], d["trade_requests"], channel.get("trade_emoji"))
             ok, err = await send_to(channel["id"], msg)
 
@@ -720,6 +1168,8 @@ def blox_fruits_trader():
                 row = build_channel_row(channel)
                 if row:
                     ch_table.update_rows([row])
+
+                schedule_channel(channel)
             else:
                 if isinstance(err, dict) and err.get("type") == "cooldown":
                     try:
@@ -749,6 +1199,12 @@ def blox_fruits_trader():
                 set_safe_mode(False, 0)
                 print(f"✗ {channel['channel_name']}: {describe_error(err)}", type_="ERROR")
 
+                row = build_channel_row(channel)
+                if row:
+                    ch_table.update_rows([row])
+
+                schedule_channel(channel)
+
         except Exception as e:
             set_safe_mode(False, 0)
             print(f"Send error: {describe_error(e)}", type_="ERROR")
@@ -767,11 +1223,92 @@ def blox_fruits_trader():
                 print(f"Channel {cid} not found", type_="WARNING")
                 return
 
+            if manager:
+                manager.unschedule(cid)
+
             save_data(d)
             ch_table.delete_rows([cid])
             print(f"Removed channel {cid}", type_="SUCCESS")
         except Exception as e:
             print(f"Remove error: {e}", type_="ERROR")
+
+    async def discover_trade_channels():
+        d = load_data()
+        kw = ["trading", "slow-trading", "fast-trading", "trade-chat", "trades", "trade"]
+        ex = ["pvb", "sab"]
+
+        new_channels = []
+        updated_channels = []
+
+        for g in bot.guilds:
+            for ch in g.text_channels:
+                name_lower = ch.name.lower()
+                if not any(k in name_lower for k in kw) or any(name_lower.startswith(e) for e in ex):
+                    continue
+
+                cid = str(ch.id)
+
+                try:
+                    slowmode_delay = getattr(ch, "slowmode_delay", None)
+                except Exception:
+                    slowmode_delay = None
+
+                cooldown = int(slowmode_delay) if slowmode_delay else 60
+                trade_emoji = await find_trade_emoji(g)
+
+                existing = next((tc for tc in d["trade_channels"] if tc["id"] == cid), None)
+
+                if existing:
+                    changed = False
+
+                    if existing.get("cooldown") != cooldown:
+                        existing["cooldown"] = cooldown
+                        changed = True
+
+                    server_icon = str(g.icon.url) if g.icon else ""
+
+                    if existing.get("server_id") != str(g.id):
+                        existing["server_id"] = str(g.id)
+                        changed = True
+
+                    if existing.get("server_name") != g.name:
+                        existing["server_name"] = g.name
+                        changed = True
+
+                    if existing.get("server_icon") != server_icon:
+                        existing["server_icon"] = server_icon
+                        changed = True
+
+                    if existing.get("channel_name") != ch.name:
+                        existing["channel_name"] = ch.name
+                        changed = True
+
+                    if trade_emoji and existing.get("trade_emoji") != trade_emoji:
+                        existing["trade_emoji"] = trade_emoji
+                        changed = True
+
+                    if changed:
+                        updated_channels.append(existing)
+                else:
+                    channel_entry = {
+                        "id": cid,
+                        "server_id": str(g.id),
+                        "server_name": g.name,
+                        "server_icon": str(g.icon.url) if g.icon else "",
+                        "channel_name": ch.name,
+                        "cooldown": cooldown,
+                        "last_sent": None,
+                        "trade_emoji": trade_emoji,
+                        "cooldown_until": None,
+                    }
+
+                    d["trade_channels"].append(channel_entry)
+                    new_channels.append(channel_entry)
+
+        if new_channels or updated_channels:
+            save_data(d)
+
+        return new_channels, updated_channels
 
     initial_channel_rows = []
     for channel in data.get("trade_channels", []):
@@ -787,14 +1324,19 @@ def blox_fruits_trader():
             {"type": "text", "label": "Status"},
             {"type": "button", "label": "Actions", "buttons": [
                 {"label": "Send Now", "color": "default", "onClick": sendNowToChannel_sync},
-                {"label": "Remove", "color": "danger", "onClick": removeChannel_sync}
+                {"label": "Pause 15m", "color": "warning", "onClick": pause_server_15m},
+                {"label": "Pause 1h", "color": "warning", "onClick": pause_server_1h},
+                {"label": "Pause 6h", "color": "warning", "onClick": pause_server_6h},
+                {"label": "Pause (Until Resume)", "color": "warning", "onClick": pause_server_until_resume},
+                {"label": "Resume Server", "color": "success", "onClick": resume_server},
+                {"label": "Remove Server (Task)", "color": "danger", "onClick": remove_server_action},
+                {"label": "Remove Channel", "color": "danger", "onClick": removeChannel_sync}
             ]}
         ], rows=initial_channel_rows
     )
 
     async def detect():
-        det_btn.loading = True
-        det_btn.disabled = True
+        det_btn.loading = True; det_btn.disabled = True
         try:
             d = load_data()
             added = 0
@@ -809,12 +1351,7 @@ def blox_fruits_trader():
                     n = ch.name.lower()
                     if any(k in n for k in kw) and not any(n.startswith(e) for e in ex):
                         cid = str(ch.id)
-                        # Determine slowmode-based cooldown; default to 60 only when off/None
-                        try:
-                            sd = getattr(ch, 'slowmode_delay', None)
-                        except Exception:
-                            sd = None
-                        cooldown = int(sd) if sd else 60
+                        cooldown = channel_cooldown_seconds(ch)
 
                         trade_emoji = await find_trade_emoji(g)
 
@@ -831,12 +1368,14 @@ def blox_fruits_trader():
                             if trade_emoji:
                                 existing["trade_emoji"] = trade_emoji
 
+                            schedule_channel(ch, existing)
+
                             row = build_channel_row(existing)
                             if row:
                                 ch_table.update_rows([row])
                         else:
                             # New entry with actual cooldown
-                            d["trade_channels"].append({
+                            new_entry = {
                                 "id": cid,
                                 "server_id": str(g.id),
                                 "server_name": g.name,
@@ -846,9 +1385,13 @@ def blox_fruits_trader():
                                 "last_sent": None,
                                 "trade_emoji": trade_emoji,
                                 "cooldown_until": None
-                            })
+                            }
 
-                            row = build_channel_row(d["trade_channels"][-1])
+                            d["trade_channels"].append(new_entry)
+
+                            schedule_channel(ch, new_entry)
+
+                            row = build_channel_row(new_entry)
                             if row:
                                 ch_table.insert_rows([row])
                             added += 1
@@ -864,8 +1407,7 @@ def blox_fruits_trader():
         except Exception as e:
             print(f"✗ Detect failed: {describe_error(e)}", type_="ERROR")
         finally:
-            det_btn.loading = False
-            det_btn.disabled = False
+            det_btn.loading = False; det_btn.disabled = False
 
     async def add():
         add_btn.loading = True
@@ -914,7 +1456,7 @@ def blox_fruits_trader():
             relock_button = True
 
             # Enable start button if we have trade configured
-            if d["trade_offers"] and d["trade_requests"]:
+            if has_trade_config(d):
                 start_btn.disabled = False
 
         except Exception as e:
@@ -929,29 +1471,39 @@ def blox_fruits_trader():
     def save_trade():
         save_btn.loading = True
         d = load_data()
-        
-        offers = parse_trade_input(off_in.value)
-        requests = parse_trade_input(req_in.value)
-        
+
+        offers_text = off_in.value.strip()
+        requests_text = req_in.value.strip()
+
+        offers = parse_trade_input(offers_text)
+        requests = parse_trade_input(requests_text)
+
+        d["trade_offers_text"] = offers_text
+        d["trade_requests_text"] = requests_text
         d["trade_offers"] = offers
         d["trade_requests"] = requests
         save_data(d)
-        
+
         ex = [r["id"] for r in tr_table.rows]
         if ex:
             tr_table.delete_rows(ex)
-        
-        if offers:
-            tr_table.insert_rows([{"id": "o", "cells": [{"text": f"Offering: {' '.join(offers)}"}]}])
-        if requests:
-            tr_table.insert_rows([{"id": "r", "cells": [{"text": f"Requesting: {' '.join(requests)}"}]}])
-        
-        print(f"Saved: {len(offers)} offers, {len(requests)} requests", type_="SUCCESS")
-        
+
+        if offers_text:
+            tr_table.insert_rows([{"id": "o", "cells": [{"text": f"Offering: {', '.join(offers) if offers else offers_text}"}]}])
+        if requests_text:
+            tr_table.insert_rows([{"id": "r", "cells": [{"text": f"Requesting: {', '.join(requests) if requests else requests_text}"}]}])
+
+        offer_items = parse_items(offers_text)
+        request_items = parse_items(requests_text)
+        offer_count = sum(count for _, count in offer_items) if offer_items else len(offers)
+        request_count = sum(count for _, count in request_items) if request_items else len(requests)
+
+        print(f"Saved: {offer_count} offers, {request_count} requests", type_="SUCCESS")
+
         save_btn.loading = False
-        
+
         # Enable start button if we have channels
-        if d["trade_channels"]:
+        if d["trade_channels"] and has_trade_config(d):
             start_btn.disabled = False
 
     async def send_batch():
@@ -962,7 +1514,7 @@ def blox_fruits_trader():
         
         d = load_data()
         
-        if not d["trade_offers"] or not d["trade_requests"]:
+        if not has_trade_config(d):
             print("Configure trade first", type_="WARNING")
             AutoState.batch_running = False
             start_btn.disabled = False
@@ -985,14 +1537,22 @@ def blox_fruits_trader():
             if AutoState.should_stop:
                 print(f"⏸ Batch stopped at channel {idx}/{total}: {c['channel_name']}", type_="WARNING")
                 break
-                
+
             try:
+                guild_id = c.get("server_id")
+                if guild_id:
+                    label = describe_suppression(guild_id)
+                    if label:
+                        skip += 1
+                        print(f"[{idx}/{total}] ⏸️ {c['channel_name']}: {label}", type_="WARNING")
+                        continue
+
                 rem = get_cooldown_remaining(c)
                 if rem > 0:
                     skip += 1
                     print(f"[{idx}/{total}] Skipped {c['channel_name']} (cooldown: {rem}s)", type_="INFO")
                     continue
-                
+
                 msg = await build_msg(c["server_id"], d["trade_offers"], d["trade_requests"], c.get("trade_emoji"))
                 ok, err = await send_to(c["id"], msg)
 
@@ -1040,7 +1600,11 @@ def blox_fruits_trader():
             print(f"Batch stopped: {sent} sent, {skip} skipped, {fail} failed", type_="WARNING")
         else:
             print(f"Batch complete: {sent} sent, {skip} skipped, {fail} failed", type_="SUCCESS")
-        
+
+        cleared = clear_task_suppressions()
+        if cleared:
+            refresh_all_rows()
+
         AutoState.batch_running = False
         AutoState.should_stop = False
         start_btn.disabled = False
@@ -1048,7 +1612,8 @@ def blox_fruits_trader():
     async def auto_loop(manager):
         print("Auto-send loop started", type_="INFO")
 
-        error_log = []
+        if AutoState.running:
+            return
 
         try:
             while manager.running:
@@ -1168,10 +1733,10 @@ def blox_fruits_trader():
     def start_operation():
         d = load_data()
         
-        if not d["trade_offers"] or not d["trade_requests"]:
+        if not has_trade_config(d):
             print("Configure trade first", type_="WARNING")
             return
-        
+
         if not d["trade_channels"]:
             print("Add channels first", type_="WARNING")
             return
@@ -1199,6 +1764,12 @@ def blox_fruits_trader():
                 AutoState.should_stop = True
                 print("Stopping batch send...", type_="WARNING")
 
+    async def handle_auto_toggle(value):
+        if value:
+            await start_auto_mode()
+        else:
+            await stop_auto_mode()
+
     # Event Handlers
     def on_srv_input(v):
         add_btn.disabled = not (v and ch_in.value and v.isdigit() and len(v) >= 17)
@@ -1211,18 +1782,19 @@ def blox_fruits_trader():
     
     def on_req_input(v):
         save_btn.disabled = not (v and off_in.value)
-    
+
     srv_in.onInput = on_srv_input
     ch_in.onInput = on_ch_input
+    auto_check.onChange = lambda v: bot.loop.create_task(handle_auto_toggle(v))
     off_in.onInput = on_off_input
     req_in.onInput = on_req_input
     
-    add_btn.onClick = lambda: bot.loop.create_task(add())
-    det_btn.onClick = lambda: bot.loop.create_task(detect())
+    add_btn.onClick = handle_add
+    det_btn.onClick = handle_detect
     save_btn.onClick = save_trade
     start_btn.onClick = start_operation
     stop_btn.onClick = stop_operation
-    test_btn.onClick = lambda: bot.loop.create_task(send_test_format())
+    test_btn.onClick = handle_test
 
     # Initialization
     async def init():
@@ -1237,13 +1809,21 @@ def blox_fruits_trader():
                 except:
                     pass
         
-        if d.get("trade_offers") and d.get("trade_requests"):
-            off_in.value = " ".join(d["trade_offers"])
-            req_in.value = " ".join(d["trade_requests"])
+        if has_trade_config(d):
+            offers_text = d.get("trade_offers_text", "")
+            requests_text = d.get("trade_requests_text", "")
 
-            tr_table.insert_rows([{"id": "o", "cells": [{"text": f"Offering: {' '.join(d['trade_offers'])}"}]}])
-            tr_table.insert_rows([{"id": "r", "cells": [{"text": f"Requesting: {' '.join(d['trade_requests'])}"}]}])
-            
+            off_in.value = offers_text
+            req_in.value = requests_text
+
+            offers_display = d.get("trade_offers") or parse_trade_input(offers_text)
+            requests_display = d.get("trade_requests") or parse_trade_input(requests_text)
+
+            if offers_display:
+                tr_table.insert_rows([{"id": "o", "cells": [{"text": f"Offering: {', '.join(offers_display)}"}]}])
+            if requests_display:
+                tr_table.insert_rows([{"id": "r", "cells": [{"text": f"Requesting: {', '.join(requests_display)}"}]}])
+
             # Enable start button if we have channels
             if d["trade_channels"]:
                 start_btn.disabled = False
