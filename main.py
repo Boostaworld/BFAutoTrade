@@ -140,18 +140,8 @@ def blox_fruits_trader():
 
             for name_norm, count in parsed:
                 canonical = NAME_CANONICAL_MAP.get(name_norm, name_norm)
-                search_candidates = []
-                seen = set()
-
-                for candidate in (canonical, name_norm):
-                    if candidate and candidate not in seen:
-                        seen.add(candidate)
-                        search_candidates.append(candidate)
-
-                for alias_norm in NORMALIZED_ALIASES.get(canonical, []):
-                    if alias_norm not in seen:
-                        seen.add(alias_norm)
-                        search_candidates.append(alias_norm)
+                all_candidates = [canonical, name_norm] + NORMALIZED_ALIASES.get(canonical, [])
+                search_candidates = list(dict.fromkeys(c for c in all_candidates if c))
 
                 em = None
                 for candidate in search_candidates:
