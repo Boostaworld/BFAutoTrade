@@ -22,15 +22,159 @@ def blox_fruits_trader():
         return {
             "trade_channels": [],
             "trade_offers": [],
-            "trade_requests": []
+            "trade_requests": [],
+            "trade_offers_text": "",
+            "trade_requests_text": ""
         }
 
     FRUIT_ALIASES = {
         "leopard": ["tiger"], "rumble": ["lightning"], "spirit": ["soul"],
         "t-rex": ["trex", "rex"], "control": ["kage"], "dough": ["doughnut"],
         "buddha": ["budha"], "phoenix": ["phenix", "pheonix"],
-        "storage": ["capacity"], "storages": ["capacity"],
+        "storage": ["capacity", "storages"],
+        "gas": ["gases"],
     }
+
+    def _norm_name(s: str) -> str:
+        return re.sub(r"[^a-z0-9_]+", "_", s.strip().lower())
+
+    def build_emoji_cache():
+        cache = {}
+        bot_obj = globals().get("bot")
+        if not bot_obj:
+            return cache
+
+        for g in getattr(bot_obj, "guilds", []):
+            for e in getattr(g, "emojis", []):
+                cache[_norm_name(e.name)] = e
+
+        return cache
+
+    EMOJI_CACHE = build_emoji_cache()
+
+    def resolve_emoji(name_norm):
+        if not name_norm:
+            return None
+
+        if name_norm in EMOJI_CACHE:
+            return EMOJI_CACHE[name_norm]
+
+        for k, e in EMOJI_CACHE.items():
+            if k.startswith(name_norm):
+                EMOJI_CACHE[name_norm] = e
+                return e
+
+        for k, e in EMOJI_CACHE.items():
+            if name_norm in k:
+                EMOJI_CACHE[name_norm] = e
+                return e
+
+        return None
+
+    NAME_CANONICAL_MAP = {}
+    NORMALIZED_ALIASES = {}
+    for canonical, alias_list in FRUIT_ALIASES.items():
+        canonical_norm = _norm_name(canonical)
+        NAME_CANONICAL_MAP[canonical_norm] = canonical_norm
+        normalized_aliases = []
+        for alias in alias_list:
+            alias_norm = _norm_name(alias)
+            NAME_CANONICAL_MAP[alias_norm] = canonical_norm
+            normalized_aliases.append(alias_norm)
+        if normalized_aliases:
+            NORMALIZED_ALIASES[canonical_norm] = normalized_aliases
+
+    def _split_chunks(text):
+        if not text:
+            return []
+
+        prepared = re.sub(r"[\n;]+", ",", text)
+        prepared = prepared.replace("~", ", or,")
+        return [c.strip() for c in prepared.split(",") if c.strip()]
+
+    _COUNT_RX = re.compile(r"(?i)^(?:(\d+)\s+)?([a-z][a-z0-9_ \-]+?)(?:\s*x\s*(\d+))?$")
+
+    def parse_items(s: str):
+        items = []
+        for chunk in _split_chunks(s):
+            m = _COUNT_RX.match(chunk)
+            if not m:
+                continue
+            c1, name, c3 = m.groups()
+            base_name = name.strip()
+            if " " in base_name:
+                parts = base_name.split()
+                parts[-1] = singularize_token(parts[-1])
+                base_name = " ".join(parts)
+            else:
+                base_name = singularize_token(base_name)
+            count = int(c1 or c3 or 1)
+            items.append((_norm_name(base_name), count))
+        return items
+
+    def fallback_text_tokens(raw):
+        if not raw:
+            return []
+        tokens = []
+        for chunk in _split_chunks(raw):
+            if LITERAL_EMOJI_PATTERN.match(chunk):
+                tokens.append(chunk)
+            else:
+                tokens.append(f"`{chunk}`")
+        return tokens
+
+    def tokens_from_items(s: str):
+        parts = []
+        if not s:
+            return parts
+
+        for chunk in _split_chunks(s):
+            if LITERAL_EMOJI_PATTERN.match(chunk):
+                parts.append(chunk)
+                continue
+
+            parsed = parse_items(chunk)
+            if not parsed:
+                parts.append(f"`{chunk}`")
+                continue
+
+            for name_norm, count in parsed:
+                canonical = NAME_CANONICAL_MAP.get(name_norm, name_norm)
+                search_candidates = []
+                seen = set()
+
+                for candidate in (canonical, name_norm):
+                    if candidate and candidate not in seen:
+                        seen.add(candidate)
+                        search_candidates.append(candidate)
+
+                for alias_norm in NORMALIZED_ALIASES.get(canonical, []):
+                    if alias_norm not in seen:
+                        seen.add(alias_norm)
+                        search_candidates.append(alias_norm)
+
+                em = None
+                for candidate in search_candidates:
+                    em = resolve_emoji(candidate)
+                    if em:
+                        EMOJI_CACHE.setdefault(name_norm, em)
+                        break
+
+                if not em and canonical == "or":
+                    parts.extend(["🔁"] * count)
+                    continue
+
+                if em:
+                    tok = f"<a:{em.name}:{em.id}>" if getattr(em, "animated", False) else f"<:{em.name}:{em.id}>"
+                    parts.extend([tok] * count)
+                else:
+                    readable = canonical.replace("_", " ")
+                    if count > 1:
+                        readable = f"{readable} x{count}"
+                    print(f"⚠ unknown emoji: {chunk}", type_="WARNING")
+                    parts.append(f"`{readable}`")
+
+        return parts
 
     TOKEN_PATTERN = re.compile(r'<a?:[^:]+:\d+>|:[^:\s]+:|[^,\s]+')
     LITERAL_EMOJI_PATTERN = re.compile(r'^<a?:[^:]+:\d+>$')
@@ -69,36 +213,30 @@ def blox_fruits_trader():
         if not raw:
             return []
 
-        tokens = TOKEN_PATTERN.findall(raw)
-        if not tokens:
-            return []
+        display = []
+        for chunk in _split_chunks(raw):
+            if LITERAL_EMOJI_PATTERN.match(chunk):
+                display.append(chunk)
+                continue
 
-        expanded = []
-        i = 0
-        while i < len(tokens):
-            token = tokens[i]
+            parsed = parse_items(chunk)
+            if not parsed:
+                display.append(chunk)
+                continue
 
-            if token.isdigit() and i + 1 < len(tokens):
-                try:
-                    count = int(token)
-                except ValueError:
-                    count = 0
+            for name_norm, count in parsed:
+                canonical = NAME_CANONICAL_MAP.get(name_norm, name_norm)
+                label = canonical.replace("_", " ")
+                if count > 1:
+                    label = f"{label} x{count}"
+                display.append(label)
 
-                if count > 0:
-                    next_token = tokens[i + 1]
-                    if next_token not in SEPARATOR_TOKENS:
-                        base_token = singularize_token(next_token)
-                        if base_token and base_token not in SEPARATOR_TOKENS and not base_token.isdigit():
-                            expanded.extend([base_token] * count)
-                            i += 2
-                            continue
-
-            expanded.append(token)
-            i += 1
-
-        return expanded
+        return display
 
     def normalize_trade_entries(values):
+        if isinstance(values, str):
+            return parse_trade_input(values)
+
         if not isinstance(values, list):
             return []
 
@@ -239,6 +377,26 @@ def blox_fruits_trader():
         data["trade_offers"] = normalized_offers
         data["trade_requests"] = normalized_requests
 
+        offers_text_raw = raw.get("trade_offers_text")
+        if isinstance(offers_text_raw, str):
+            offers_text = offers_text_raw.strip()
+        else:
+            offers_text = ", ".join(normalized_offers)
+
+        requests_text_raw = raw.get("trade_requests_text")
+        if isinstance(requests_text_raw, str):
+            requests_text = requests_text_raw.strip()
+        else:
+            requests_text = ", ".join(normalized_requests)
+
+        if offers_text != offers_text_raw:
+            changed = True
+        if requests_text != requests_text_raw:
+            changed = True
+
+        data["trade_offers_text"] = offers_text
+        data["trade_requests_text"] = requests_text
+
         for tc in data.get("trade_channels", []):
             if "cooldown_until" not in tc:
                 tc["cooldown_until"] = None
@@ -256,6 +414,9 @@ def blox_fruits_trader():
             tmp.replace(DATA_FILE)
         except:
             pass
+
+    def has_trade_config(data):
+        return bool(data.get("trade_offers_text") and data.get("trade_requests_text"))
 
     def load_emoji_cache():
         try:
@@ -534,30 +695,38 @@ def blox_fruits_trader():
         except:
             return None
 
-    async def build_msg(gid, offers, requests, te=None):
+    async def build_msg(gid, offers_text, requests_text, te=None):
+        offers_text = offers_text or ""
+        requests_text = requests_text or ""
+
         g = bot.get_guild(int(gid))
+        if g:
+            for e in getattr(g, "emojis", []):
+                key = _norm_name(e.name)
+                if key not in EMOJI_CACHE:
+                    EMOJI_CACHE[key] = e
+
         if not te:
             te = await find_trade_emoji(g) if g else "↔️"
 
-        oe = []
-        for o in offers:
-            if o in SEPARATOR_TOKENS:
-                oe.append(o)
-                continue
+        left_tokens = tokens_from_items(offers_text)
+        right_tokens = tokens_from_items(requests_text)
 
-            e = await fetch_emoji(gid, o.strip())
-            oe.append(e if e else f"`{o.strip()}`")
+        if not left_tokens:
+            left_tokens = fallback_text_tokens(offers_text)
+        if not right_tokens:
+            right_tokens = fallback_text_tokens(requests_text)
 
-        re = []
-        for r in requests:
-            if r in SEPARATOR_TOKENS:
-                re.append(r)
-                continue
+        left = " ".join(left_tokens).strip()
+        right = " ".join(right_tokens).strip()
 
-            e = await fetch_emoji(gid, r.strip())
-            re.append(e if e else f"`{r.strip()}`")
-
-        return f"{' '.join(oe)} {te} {' '.join(re)}"
+        if left and right:
+            return f"{left} {te} {right}"
+        if left:
+            return f"{left} {te}".strip()
+        if right:
+            return f"{te} {right}".strip()
+        return te
 
     async def send_to(cid, msg):
         try:
@@ -589,7 +758,7 @@ def blox_fruits_trader():
         print("Sending test format...", type_="INFO")
         try:
             d = load_data()
-            if not d["trade_offers"] or not d["trade_requests"]:
+            if not has_trade_config(d):
                 print("Configure trade first", type_="WARNING")
                 return
 
@@ -600,7 +769,7 @@ def blox_fruits_trader():
             if not server_id:
                 server_id = "0"
 
-            msg = await build_msg(server_id, d["trade_offers"], d["trade_requests"])
+            msg = await build_msg(server_id, d.get("trade_offers_text", ""), d.get("trade_requests_text", ""))
             ok, err = await send_to("1390328683494903978", msg)
 
             if ok:
@@ -618,7 +787,7 @@ def blox_fruits_trader():
         try:
             d = load_data()
             
-            if not d["trade_offers"] or not d["trade_requests"]:
+            if not has_trade_config(d):
                 print("Configure trade first", type_="WARNING")
                 return
             
@@ -632,7 +801,7 @@ def blox_fruits_trader():
                 print("Channel not found", type_="ERROR")
                 return
             
-            msg = await build_msg(channel["server_id"], d["trade_offers"], d["trade_requests"], channel.get("trade_emoji"))
+            msg = await build_msg(channel["server_id"], d.get("trade_offers_text", ""), d.get("trade_requests_text", ""), channel.get("trade_emoji"))
             ok, err = await send_to(channel["id"], msg)
             
             if ok:
@@ -780,7 +949,7 @@ def blox_fruits_trader():
             print(f"✓ Detection complete: Found {added} new trading channels", type_="SUCCESS")
             
             # Enable start button if we have channels and trade configured
-            if d["trade_channels"] and d["trade_offers"] and d["trade_requests"]:
+            if d["trade_channels"] and has_trade_config(d):
                 start_btn.disabled = False
                 
         except Exception as e:
@@ -836,7 +1005,7 @@ def blox_fruits_trader():
             add_btn.disabled = True
             
             # Enable start button if we have trade configured
-            if d["trade_offers"] and d["trade_requests"]:
+            if has_trade_config(d):
                 start_btn.disabled = False
                 
         except Exception as e:
@@ -847,29 +1016,39 @@ def blox_fruits_trader():
     def save_trade():
         save_btn.loading = True
         d = load_data()
-        
-        offers = parse_trade_input(off_in.value)
-        requests = parse_trade_input(req_in.value)
-        
+
+        offers_text = off_in.value.strip()
+        requests_text = req_in.value.strip()
+
+        offers = parse_trade_input(offers_text)
+        requests = parse_trade_input(requests_text)
+
+        d["trade_offers_text"] = offers_text
+        d["trade_requests_text"] = requests_text
         d["trade_offers"] = offers
         d["trade_requests"] = requests
         save_data(d)
-        
+
         ex = [r["id"] for r in tr_table.rows]
         if ex:
             tr_table.delete_rows(ex)
-        
-        if offers:
-            tr_table.insert_rows([{"id": "o", "cells": [{"text": f"Offering: {' '.join(offers)}"}]}])
-        if requests:
-            tr_table.insert_rows([{"id": "r", "cells": [{"text": f"Requesting: {' '.join(requests)}"}]}])
-        
-        print(f"Saved: {len(offers)} offers, {len(requests)} requests", type_="SUCCESS")
-        
+
+        if offers_text:
+            tr_table.insert_rows([{"id": "o", "cells": [{"text": f"Offering: {', '.join(offers) if offers else offers_text}"}]}])
+        if requests_text:
+            tr_table.insert_rows([{"id": "r", "cells": [{"text": f"Requesting: {', '.join(requests) if requests else requests_text}"}]}])
+
+        offer_items = parse_items(offers_text)
+        request_items = parse_items(requests_text)
+        offer_count = sum(count for _, count in offer_items) if offer_items else len(offers)
+        request_count = sum(count for _, count in request_items) if request_items else len(requests)
+
+        print(f"Saved: {offer_count} offers, {request_count} requests", type_="SUCCESS")
+
         save_btn.loading = False
-        
+
         # Enable start button if we have channels
-        if d["trade_channels"]:
+        if d["trade_channels"] and has_trade_config(d):
             start_btn.disabled = False
 
     async def send_batch():
@@ -880,7 +1059,7 @@ def blox_fruits_trader():
         
         d = load_data()
         
-        if not d["trade_offers"] or not d["trade_requests"]:
+        if not has_trade_config(d):
             print("Configure trade first", type_="WARNING")
             AutoState.batch_running = False
             start_btn.disabled = False
@@ -911,7 +1090,7 @@ def blox_fruits_trader():
                     print(f"[{idx}/{total}] Skipped {c['channel_name']} (cooldown: {rem}s)", type_="INFO")
                     continue
                 
-                msg = await build_msg(c["server_id"], d["trade_offers"], d["trade_requests"], c.get("trade_emoji"))
+                msg = await build_msg(c["server_id"], d.get("trade_offers_text", ""), d.get("trade_requests_text", ""), c.get("trade_emoji"))
                 ok, err = await send_to(c["id"], msg)
                 
                 if ok:
@@ -967,7 +1146,7 @@ def blox_fruits_trader():
             try:
                 d = load_data()
 
-                if not d["trade_offers"] or not d["trade_requests"] or not d["trade_channels"]:
+                if not has_trade_config(d) or not d["trade_channels"]:
                     await asyncio.sleep(5)
                     continue
 
@@ -986,7 +1165,7 @@ def blox_fruits_trader():
 
                     if rem <= 0:
                         try:
-                            msg = await build_msg(c["server_id"], d["trade_offers"], d["trade_requests"], c.get("trade_emoji"))
+                            msg = await build_msg(c["server_id"], d.get("trade_offers_text", ""), d.get("trade_requests_text", ""), c.get("trade_emoji"))
                             ok, err = await send_to(c["id"], msg)
 
                             if ok:
@@ -1070,7 +1249,7 @@ def blox_fruits_trader():
     def start_operation():
         d = load_data()
         
-        if not d["trade_offers"] or not d["trade_requests"]:
+        if not has_trade_config(d):
             print("Configure trade first", type_="WARNING")
             return
         
@@ -1142,13 +1321,21 @@ def blox_fruits_trader():
                 except:
                     pass
         
-        if d.get("trade_offers") and d.get("trade_requests"):
-            off_in.value = " ".join(d["trade_offers"])
-            req_in.value = " ".join(d["trade_requests"])
+        if has_trade_config(d):
+            offers_text = d.get("trade_offers_text", "")
+            requests_text = d.get("trade_requests_text", "")
 
-            tr_table.insert_rows([{"id": "o", "cells": [{"text": f"Offering: {' '.join(d['trade_offers'])}"}]}])
-            tr_table.insert_rows([{"id": "r", "cells": [{"text": f"Requesting: {' '.join(d['trade_requests'])}"}]}])
-            
+            off_in.value = offers_text
+            req_in.value = requests_text
+
+            offers_display = d.get("trade_offers") or parse_trade_input(offers_text)
+            requests_display = d.get("trade_requests") or parse_trade_input(requests_text)
+
+            if offers_display:
+                tr_table.insert_rows([{"id": "o", "cells": [{"text": f"Offering: {', '.join(offers_display)}"}]}])
+            if requests_display:
+                tr_table.insert_rows([{"id": "r", "cells": [{"text": f"Requesting: {', '.join(requests_display)}"}]}])
+
             # Enable start button if we have channels
             if d["trade_channels"]:
                 start_btn.disabled = False
